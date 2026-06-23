@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+*.wav
+history.db
+config.toml
+
+# transient build staging (mount may lock these)
+/spokengo-*/
+
+*.log
+
+# superseded preview images (replaced by assets/screenshot.png; mount-locked)
+assets/overlay.png
+assets/record_button.png

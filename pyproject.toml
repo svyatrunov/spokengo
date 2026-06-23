@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spokengo"
+version = "0.8.0"
+description = "Voice input into any field via a global hotkey (Groq Whisper)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "SpokenGo contributors" }]
+keywords = ["voice", "dictation", "whisper", "groq", "speech-to-text", "windows"]
+classifiers = [
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "tomli; python_version < '3.11'",
+]
+
+[project.urls]
+Homepage = "https://github.com/spokengo/spokengo"
+Issues = "https://github.com/spokengo/spokengo/issues"
+
+[project.optional-dependencies]
+# Installed on the end-user's Windows machine to enable mic + hotkeys + overlay.
+runtime = [
+    "sounddevice>=0.4",
+    "keyring>=24",
+    "pywin32>=306; sys_platform == 'win32'",
+    "Pillow>=10",
+]
+dev = ["pytest>=7", "pytest-cov"]
+
+# Console entry (has a terminal window) — handy for `spokengo logs`, `set-key`.
+[project.scripts]
+spokengo = "spokengo.__main__:main"
+
+# Windowed entry (NO console window) — this is what the desktop shortcut runs.
+[project.gui-scripts]
+spokengo-gui = "spokengo.__main__:gui_entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+spokengo = ["assets/*.ico"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
