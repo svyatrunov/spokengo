@@ -24,8 +24,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/spokengo/spokengo"
-Issues = "https://github.com/spokengo/spokengo/issues"
+Homepage = "https://github.com/svyatrunov/SpokenGo"
+Issues = "https://github.com/svyatrunov/SpokenGo/issues"
 
 [project.optional-dependencies]
 # Installed on the end-user's Windows machine to enable mic + hotkeys + overlay.
@@ -35,7 +35,7 @@ runtime = [
     "pywin32>=306; sys_platform == 'win32'",
     "Pillow>=10",
 ]
-dev = ["pytest>=7", "pytest-cov"]
+dev = ["pytest>=7", "pytest-cov", "Pillow>=10"]
 
 # Console entry (has a terminal window) — handy for `spokengo logs`, `set-key`.
 [project.scripts]

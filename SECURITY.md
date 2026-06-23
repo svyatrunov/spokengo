@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Please report security issues privately via a [GitHub security advisory](https://github.com/spokengo/spokengo/security/advisories/new)
+Please report security issues privately via a [GitHub security advisory](https://github.com/svyatrunov/SpokenGo/security/advisories/new)
 or by opening an issue marked **[security]**. We aim to respond within a few days.
 
 ## What SpokenGo does and does not do

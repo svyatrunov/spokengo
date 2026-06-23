@@ -5,8 +5,8 @@ Thanks for your interest! Contributions of all sizes are welcome.
 ## Development setup
 
 ```bash
-git clone https://github.com/spokengo/spokengo.git
-cd spokengo
+git clone https://github.com/svyatrunov/SpokenGo.git
+cd SpokenGo
 pip install -e ".[dev]"
 pytest
 ```

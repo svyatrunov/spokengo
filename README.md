@@ -36,8 +36,8 @@
 You need [Python 3.10+](https://www.python.org/downloads/) (tick *Add to PATH* during install).
 
 ```powershell
-git clone https://github.com/spokengo/spokengo.git
-cd spokengo
+git clone https://github.com/svyatrunov/SpokenGo.git
+cd SpokenGo
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 

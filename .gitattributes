@@ -1,0 +1,15 @@
+# Normalize line endings: store LF in the repo, check out LF everywhere.
+# This silences the "LF will be replaced by CRLF" warnings on Windows and keeps
+# the repository consistent across platforms.
+* text=auto eol=lf
+
+# Binary assets — never touch their bytes.
+*.png  binary
+*.ico  binary
+*.wav  binary
+
+# Keep PowerShell scripts as LF (PowerShell runs LF fine).
+*.ps1  text eol=lf
+
+# Language hints for GitHub's diff/linguist.
+*.py   text diff=python
