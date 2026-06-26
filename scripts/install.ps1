@@ -25,9 +25,16 @@ Step 3 "Installing SpokenGo + runtime dependencies..."
 & $venvPy -m pip install -e ".[runtime]"
 
 Step 4 "Setting up your Groq API key..."
-Write-Host "    Get a free key at https://console.groq.com/keys"
-$key = Read-Host "    Paste your Groq API key (or press Enter to set it later in the app)"
-if ($key) { & $venvPy -m spokengo set-key groq $key }
+# Skip the prompt if a key is already stored (Credential Manager persists it
+# across installs) — pressing Enter previously kept it, but asking again is noise.
+& $venvPy -c "import sys; from spokengo.secrets_store import get_key; sys.exit(0 if get_key('groq') else 1)" 2>$null
+if ($LASTEXITCODE -eq 0) {
+    Write-Host "    A Groq API key is already saved — keeping it. Change it anytime in the app's Settings."
+} else {
+    Write-Host "    Get a free key at https://console.groq.com/keys"
+    $key = Read-Host "    Paste your Groq API key (or press Enter to set it later in the app)"
+    if ($key) { & $venvPy -m spokengo set-key groq $key }
+}
 
 Step 5 "Creating shortcuts..."
 $icon = Join-Path $root "src\spokengo\assets\spokengo.ico"

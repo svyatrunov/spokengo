@@ -52,6 +52,25 @@ The installer sets everything up in an isolated `.venv` and puts a **SpokenGo ic
 
 The key is stored in the Windows Credential Manager (service `SpokenGo`), not on disk.
 
+## Run it like a normal app (no console)
+
+`scripts\install.ps1` already creates a **Desktop + Start Menu shortcut** that
+launches SpokenGo windowed (no terminal). Just double-click it.
+
+### Start automatically at login
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\autostart.ps1
+```
+
+This adds SpokenGo to your Startup folder (windowed, no console). Undo with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\autostart.ps1 -Remove
+```
+
+A single-instance guard means it never launches twice.
+
 ## Usage
 
 | Action | Key |
@@ -68,7 +87,7 @@ Press the hotkey anywhere, speak, press `Enter`. The text is pasted into whateve
 - **Your data**: recordings and transcript history are stored locally under `%APPDATA%\SpokenGo` and can be auto-deleted (configurable). Audio storage can be turned off entirely.
 - **Network**: the app talks to exactly one endpoint — `api.groq.com` — to transcribe. Nothing else.
 - **No telemetry**, no analytics, no background calls. Failed transcriptions are retried only when you press *Retry*.
-- The clipboard is restored to its previous contents after each paste.
+- The last transcript stays on your clipboard, so you can paste it again anywhere even if the paste missed (set `restore_clipboard = true` in the config to restore your previous clipboard instead).
 
 See [docs/BUGS.md](docs/BUGS.md) for the full list of edge cases handled, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
 

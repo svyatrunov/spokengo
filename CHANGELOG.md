@@ -3,6 +3,14 @@
 All notable changes are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.9.0
+
+- Reliability: dictations are never lost. The last transcript stays on the
+  clipboard (paste it again anywhere), the History tab has one-click copy and
+  per-item retry, and there's a "Copy last" button on the main view.
+- Fail-fast on network/VPN loss: ~15-30s timeout instead of minutes; the audio
+  is queued so you can retry when you're back online.
+
 ## 0.8.0
 
 - Packaging for distribution: Desktop + Start Menu shortcuts via `install.ps1`,

@@ -60,6 +60,13 @@ def _wait_idle(ctrl):
         time.sleep(0.01)
 
 
+def _wait_event(ov, kind):
+    for _ in range(300):
+        if any(e[0] == kind for e in ov.events):
+            return
+        time.sleep(0.01)
+
+
 def test_overlay_shows_target_then_hides(tmp_path):
     ov = FakeOverlay()
     target = Target(handle=123, title="Telegram", is_app=True, process_name="Telegram.exe")
@@ -68,7 +75,7 @@ def test_overlay_shows_target_then_hides(tmp_path):
     assert ov.events[0][0] == "show"
     assert ov.events[0][1].process_name == "Telegram.exe"
     ctrl.toggle()                       # stop -> transcribe -> hide
-    _wait_idle(ctrl)
+    _wait_event(ov, "hide")
     kinds = [e[0] for e in ov.events]
     assert "state" in kinds            # switched to transcribing
     assert kinds[-1] == "hide"         # hidden at the end
@@ -83,7 +90,7 @@ def test_overlay_hides_on_silent(tmp_path):
         provider_factory=lambda c: FakeProvider())
     ctrl.overlay = ov
     ctrl.toggle(); ctrl.toggle()
-    _wait_idle(ctrl)
+    _wait_event(ov, "hide")
     assert ov.events[-1][0] == "hide"   # even a silent take cleans up the overlay
 
 

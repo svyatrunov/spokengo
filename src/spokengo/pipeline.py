@@ -108,23 +108,24 @@ class VoicePipeline:
         self.state.fail(); self.state.reset()
         return None
 
-    def retry_pending(self, max_attempts: int = MAX_RETRY_ATTEMPTS) -> int:
-        """Manual/bounded retry of queued recordings. Returns count completed.
-        Exhausted items are marked FAILED so they stop being retried."""
-        done = 0
-        for rec in self.storage.pending(max_attempts=max_attempts):
-            if not rec.audio_path or not os.path.exists(rec.audio_path):
+    def retry_record(self, rec, max_attempts: int = MAX_RETRY_ATTEMPTS) -> bool:
+        """Retry a single queued recording. Returns True if it transcribed."""
+        if not rec.audio_path or not os.path.exists(rec.audio_path):
+            self.storage.mark_failed(rec.id)
+            return False
+        n = self.storage.bump_attempt(rec.id)
+        try:
+            tr = self.provider.transcribe(
+                rec.audio_path, model=rec.model or self.config.model,
+                language=self.config.language)
+        except ProviderError as exc:
+            if not getattr(exc, "transient", False) or n >= max_attempts:
                 self.storage.mark_failed(rec.id)
-                continue
-            n = self.storage.bump_attempt(rec.id)
-            try:
-                tr = self.provider.transcribe(
-                    rec.audio_path, model=rec.model or self.config.model,
-                    language=self.config.language)
-            except ProviderError as exc:
-                if not getattr(exc, "transient", False) or n >= max_attempts:
-                    self.storage.mark_failed(rec.id)
-                continue
-            self.storage.mark_done(rec.id, (tr.text or "").strip())
-            done += 1
-        return done
+            return False
+        self.storage.mark_done(rec.id, (tr.text or "").strip())
+        return True
+
+    def retry_pending(self, max_attempts: int = MAX_RETRY_ATTEMPTS) -> int:
+        """Manual/bounded retry of all queued recordings. Returns count done."""
+        return sum(1 for rec in self.storage.pending(max_attempts=max_attempts)
+                   if self.retry_record(rec, max_attempts))

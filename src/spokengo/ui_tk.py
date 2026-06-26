@@ -127,8 +127,11 @@ class ControlPanel:
         self.hero.bind("<Button-1>", lambda e: self._on_record_button())
         self.hero.bind("<Enter>", lambda e: self._set_hover(True))
         self.hero.bind("<Leave>", lambda e: self._set_hover(False))
-        self.status_lbl = self._label(wrap, "", color=MUT, size=9)
-        self.status_lbl.pack(anchor="w", pady=(8, 0))
+        row = self.tk.Frame(wrap, bg=BG)
+        row.pack(fill="x", pady=(8, 0))
+        self.status_lbl = self._label(row, "", color=MUT, size=9)
+        self.status_lbl.pack(side="left", anchor="w")
+        self._btn(row, "⧉ Копировать последний", self._copy_last).pack(side="right")
 
     def _hero_image(self, text, sub, bg):
         from PIL import Image, ImageDraw, ImageTk
@@ -280,20 +283,39 @@ class ControlPanel:
             else:
                 b.configure(bg=SURF2, fg=MUT)
 
-    # ---------- history ----------
+    # ---------- history (scrollable cards, one-click copy / retry) ----------
+    HISTORY_LIMIT = 50
+
     def _build_history(self):
-        h = self.tk.Frame(self._body, bg=BG)
+        tk = self.tk
+        h = tk.Frame(self._body, bg=BG)
         self._history = h
-        self.hist = self.tk.Listbox(h, bg=BAR, fg=TXT, selectbackground=ACC,
-                                    selectforeground="#ffffff", highlightthickness=1,
-                                    highlightbackground=BORDER, bd=0, relief="flat",
-                                    activestyle="none", font=("Segoe UI", 10))
-        self.hist.pack(fill="both", expand=True)
-        hb = self.tk.Frame(h, bg=BG); hb.pack(fill="x", pady=(10, 0))
-        self._btn(hb, "Обновить", self._refresh_history).pack(
+        bar = tk.Frame(h, bg=BG); bar.pack(fill="x", pady=(0, 8))
+        self._btn(bar, "Обновить", self._refresh_history).pack(
             side="left", expand=True, fill="x", padx=(0, 4))
-        self._btn(hb, "Повторить очередь", self._retry_queue).pack(
+        self._btn(bar, "Повторить очередь", self._retry_queue).pack(
             side="left", expand=True, fill="x", padx=(4, 0))
+
+        wrap = tk.Frame(h, bg=BG); wrap.pack(fill="both", expand=True)
+        self._hist_canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
+        sb = tk.Scrollbar(wrap, orient="vertical", command=self._hist_canvas.yview,
+                          troughcolor=BG, bg=SURF2, activebackground=ACC, bd=0,
+                          highlightthickness=0)
+        self._hist_canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self._hist_canvas.pack(side="left", fill="both", expand=True)
+        self._hist_inner = tk.Frame(self._hist_canvas, bg=BG)
+        self._hist_win = self._hist_canvas.create_window((0, 0), window=self._hist_inner,
+                                                         anchor="nw")
+        self._hist_inner.bind(
+            "<Configure>",
+            lambda e: self._hist_canvas.configure(scrollregion=self._hist_canvas.bbox("all")))
+        self._hist_canvas.bind(
+            "<Configure>",
+            lambda e: self._hist_canvas.itemconfig(self._hist_win, width=e.width))
+        self._hist_canvas.bind_all(
+            "<MouseWheel>",
+            lambda e: self._hist_canvas.yview_scroll(int(-e.delta / 120), "units"))
 
     # ---------- key actions ----------
     def _save_key(self):
@@ -428,19 +450,65 @@ class ControlPanel:
         self.root.after(0, lambda: self._set_status_text(
             f"Сочетание «{combo}» занято — задайте другое в «Настройках»."))
 
-    # ---------- history ----------
+    # ---------- copy / history ----------
+    def _copy_text(self, text: str):
+        if not text:
+            self._set_status_text("Пусто — нечего копировать"); return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()            # keep it on the clipboard after we exit
+            self._set_status_text("Скопировано в буфер обмена")
+        except Exception as exc:
+            self._set_status_text(f"Не удалось скопировать: {exc}")
+
+    def _copy_last(self):
+        self._copy_text(self.ctrl.last_text())
+
     def _retry_queue(self):
         import threading
         threading.Thread(target=lambda: (self.ctrl.retry_queue(),
                                          self.root.after(0, self._refresh_history)),
                          daemon=True).start()
 
+    def _retry_one(self, rec_id):
+        import threading
+        threading.Thread(target=lambda: (self.ctrl.retry_one(rec_id),
+                                         self.root.after(0, self._refresh_history)),
+                         daemon=True).start()
+
     def _refresh_history(self):
-        self.hist.delete(0, "end")
-        for r in self.ctrl.recent(40):
+        tk = self.tk
+        for w in self._hist_inner.winfo_children():
+            w.destroy()
+        rows = self.ctrl.recent(self.HISTORY_LIMIT)
+        if not rows:
+            self._label(self._hist_inner, "Пока нет распознаваний.", color=MUT,
+                        size=10).pack(anchor="w", padx=4, pady=8)
+            return
+        tagmap = {"pending": ("в очереди", AMBER), "failed": ("ошибка", REC)}
+        for r in rows:
+            card = tk.Frame(self._hist_inner, bg=SURF, highlightthickness=1,
+                            highlightbackground=BORDER)
+            card.pack(fill="x", pady=4, padx=2)
+            top = tk.Frame(card, bg=SURF); top.pack(fill="x", padx=10, pady=(8, 2))
             ts = time.strftime("%H:%M", time.localtime(r.ts))
-            tag = {"pending": " · в очереди", "failed": " · ошибка"}.get(r.status, "")
-            self.hist.insert("end", f"  {ts}{tag}   {r.text[:64]}")
+            self._label(top, ts, color=MUT, size=9, bg=SURF).pack(side="left")
+            if r.status in tagmap:
+                label, col = tagmap[r.status]
+                self._label(top, "· " + label, color=col, size=9, bg=SURF).pack(
+                    side="left", padx=(6, 0))
+            body = r.text if r.text else "(нет текста — можно повторить)"
+            tk.Label(card, text=body, bg=SURF, fg=TXT if r.text else MUT,
+                     font=("Segoe UI", 10), wraplength=360, justify="left"
+                     ).pack(fill="x", padx=10, anchor="w")
+            btns = tk.Frame(card, bg=SURF); btns.pack(fill="x", padx=10, pady=(4, 8))
+            if r.text:
+                self._btn(btns, "⧉ Копировать",
+                          lambda t=r.text: self._copy_text(t)).pack(side="left")
+            if r.status in ("pending", "failed") and r.audio_path:
+                self._btn(btns, "↻ Повторить",
+                          lambda i=r.id: self._retry_one(i)).pack(side="left", padx=(6, 0))
 
     # ---------- status ----------
     def _on_status(self, state: State, message: str):

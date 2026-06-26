@@ -40,6 +40,7 @@ class Config:
     silence_rms_threshold: float = 120.0  # below this = treat as silence
     debounce_ms: int = 250
     inject_fallback_typing: bool = True   # type char-by-char if paste fails
+    restore_clipboard: bool = False       # False = keep last transcript on clipboard (Ctrl+V works anywhere)
     auto_retry: bool = False              # background retry of the offline queue (off by default)
 
     @classmethod

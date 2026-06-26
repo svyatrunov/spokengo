@@ -19,3 +19,7 @@ config.toml
 # superseded preview images (replaced by assets/screenshot.png; mount-locked)
 assets/overlay.png
 assets/record_button.png
+
+# mount-locked scratch from edits
+src/spokengo/ui_tk.py.head
+src/spokengo/ui_tk.py.tail

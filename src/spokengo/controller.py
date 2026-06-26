@@ -34,7 +34,8 @@ class _NullInjector:
 def _default_injector_factory(cfg: Config):
     try:
         from .inject.windows import make_injector
-        return make_injector(cfg.inject_fallback_typing)
+        return make_injector(cfg.inject_fallback_typing,
+                             getattr(cfg, "restore_clipboard", False))
     except Exception:
         return _NullInjector()
 
@@ -139,6 +140,32 @@ class GuiController:
             return self._injector_obj().capture_target()
         except Exception:
             return None
+
+    def last_text(self) -> str:
+        """Most recent non-empty transcript (for the one-click copy)."""
+        for r in self.storage.recent(20):
+            if r.text:
+                return r.text
+        return ""
+
+    def retry_one(self, rec_id) -> bool:
+        """Retry a single recording by id (works for queued or failed items)."""
+        rec = self.storage.get(rec_id)
+        if not rec or not rec.audio_path:
+            self._emit("Нет аудио для повтора этой записи")
+            return False
+        try:
+            provider = self._provider_factory(self.cfg)
+        except Exception as exc:
+            self._emit(str(exc)); return False
+        from .pipeline import VoicePipeline
+        pipe = VoicePipeline(state=self.state, storage=self.storage,
+                             injector=self._injector_obj(), provider=provider,
+                             config=self.cfg, notify=lambda l, m: self._emit(m))
+        self.storage.reset_pending(rec_id)          # allow re-trying a failed item
+        ok = pipe.retry_record(self.storage.get(rec_id))
+        self._emit("Повтор: готово" if ok else "Повтор не удался — проверьте сеть/VPN")
+        return ok
 
     def retry_queue(self) -> int:
         """Manually retry queued (transient-failure) recordings. Bounded."""

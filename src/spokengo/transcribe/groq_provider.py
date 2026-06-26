@@ -90,7 +90,7 @@ def _error_message(body: bytes) -> str:
 class GroqProvider:
     name = "groq"
 
-    def __init__(self, api_key, *, timeout=120.0, max_retries=3, base_url=GROQ_URL,
+    def __init__(self, api_key, *, timeout=15.0, max_retries=1, base_url=GROQ_URL,
                  http_post=_http_post_multipart, sleep: Callable[[float], None] = time.sleep):
         if not api_key:
             raise AuthError("Groq API key is not set")

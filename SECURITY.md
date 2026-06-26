@@ -34,7 +34,7 @@ or by opening an issue marked **[security]**. We aim to respond within a few day
 **Code safety**
 - No `eval`, `exec`, `os.system`, `subprocess`, shell invocation, or `pickle`.
 - All SQL is parameterized.
-- The clipboard is snapshotted and restored after each paste.
+- The last transcript is kept on the clipboard (configurable) so it is never lost; nothing is sent anywhere.
 
 ## Supported versions
 

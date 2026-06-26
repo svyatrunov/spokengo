@@ -51,11 +51,12 @@ class Win32Clipboard(ClipboardBackend):  # pragma: no cover - needs Windows
 
 
 class WindowsInjector:  # pragma: no cover - needs Windows
-    def __init__(self, fallback_typing: bool = True):
+    def __init__(self, fallback_typing: bool = True, restore_clipboard: bool = False):
         self.fallback_typing = fallback_typing
         self._recent_apps: Deque[Target] = deque(maxlen=8)
         self._clip = Win32Clipboard()
         self._cycle = ClipboardCycle(self._clip, restore_delay=0.5)
+        self.restore_clipboard = restore_clipboard
 
     # --- focus ---------------------------------------------------------
     def _foreground(self) -> Target:
@@ -165,17 +166,27 @@ class WindowsInjector:  # pragma: no cover - needs Windows
     def inject(self, target: Target, text: str) -> bool:
         if not text:
             return False
+        # No real target window -> can't paste anywhere. Put the text on the
+        # clipboard so the user can Ctrl+V it, and report failure so the caller
+        # notifies them. Nothing is lost.
+        if target is None or getattr(target, "handle", None) is None:
+            try:
+                self._clip.set_text(text)
+            except Exception:
+                pass
+            return False
         self._focus(target)
         try:
-            return self._cycle.paste(text, self._send_paste)
+            self._cycle.paste(text, self._send_paste, restore=self.restore_clipboard)
+            return True
         except Exception:
             if self.fallback_typing:
                 self.type_text(text)
-                return True
-            return False
+            return True
 
 
-def make_injector(fallback_typing: bool = True):
+def make_injector(fallback_typing: bool = True, restore_clipboard: bool = False):
     if IS_WINDOWS:
-        return WindowsInjector(fallback_typing=fallback_typing)
+        return WindowsInjector(fallback_typing=fallback_typing,
+                               restore_clipboard=restore_clipboard)
     raise RuntimeError("WindowsInjector requires Windows; use a fake in tests")

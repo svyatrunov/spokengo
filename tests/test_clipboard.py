@@ -64,3 +64,12 @@ def test_restore_waits_for_consume_delay():
     assert ("sleep", 0.5) in events
     assert events.index(("paste", "TRANSCRIPT")) < events.index(("sleep", 0.5))
     assert cb.value == "OLD"                  # restored at the end
+
+
+def test_keep_transcript_when_restore_false():
+    cb = FakeClipboard(); cb.value = "ORIGINAL"
+    cyc = ClipboardCycle(cb, sleep=lambda s: None)
+    seen = {}
+    cyc.paste("транскрипт", lambda: seen.__setitem__("at_paste", cb.value), restore=False)
+    assert seen["at_paste"] == "транскрипт"
+    assert cb.value == "транскрипт"     # left on clipboard, NOT restored -> Ctrl+V works later

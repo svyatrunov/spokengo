@@ -39,7 +39,7 @@ class ClipboardCycle:
                 self._sleep(self.retry_delay)
         raise last if last else RuntimeError("clipboard operation failed")
 
-    def paste(self, text: str, do_paste: Callable[[], None]) -> bool:
+    def paste(self, text: str, do_paste: Callable[[], None], restore: bool = True) -> bool:
         """Insert ``text`` via the clipboard, calling ``do_paste`` (e.g. send
         Ctrl+V) at the right moment. Empty text is a no-op that never touches
         the clipboard (bug #6 guard). Returns True on success."""
@@ -55,11 +55,12 @@ class ClipboardCycle:
             return True
 
         self._with_retry(_set_and_verify)   # ensures our text is really there
-        try:
-            do_paste()                       # paste only after verification
-        finally:
+        do_paste()                           # paste only after verification
+        if restore:
             # Give the target time to actually consume the paste before we put
             # the user's old clipboard back (otherwise it pastes the old text).
             self._sleep(self.restore_delay)
             self._with_retry(lambda: self.backend.set_text(original or ""))
+        # When restore is False we deliberately LEAVE the transcript on the
+        # clipboard, so the user can Ctrl+V it again anywhere — nothing is lost.
         return True

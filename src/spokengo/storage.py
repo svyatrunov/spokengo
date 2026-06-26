@@ -80,6 +80,11 @@ class Storage:
                            (STATUS_DONE, text, rec_id))
         self._conn.commit()
 
+    def reset_pending(self, rec_id) -> None:
+        self._conn.execute("UPDATE transcripts SET status=?, attempts=0 WHERE id=?",
+                           (STATUS_PENDING, rec_id))
+        self._conn.commit()
+
     def mark_failed(self, rec_id) -> None:
         self._conn.execute("UPDATE transcripts SET status=? WHERE id=?",
                            (STATUS_FAILED, rec_id))

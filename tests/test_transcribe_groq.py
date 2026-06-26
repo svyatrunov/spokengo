@@ -113,3 +113,10 @@ def test_403_is_permanent_with_hint(tmp_path):
         provider(http).transcribe(str(f), model="m")
     assert ei.value.transient is False
     assert "403" in str(ei.value)
+
+
+def test_fail_fast_defaults():
+    from spokengo.transcribe.groq_provider import GroqProvider
+    p = GroqProvider("sk")
+    assert p.timeout <= 20            # short timeout, no minutes-long hang
+    assert p.max_retries <= 1         # at most one retry -> errors quickly
