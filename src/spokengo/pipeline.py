@@ -40,12 +40,12 @@ class VoicePipeline:
         os.close(fd)
         return audiolib.write_wav(frames, self.config.sample_rate, path)
 
-    def process(self, frames: bytes, target=None) -> Optional[int]:
+    def process(self, frames: bytes, target=None) -> tuple:
         try:
             if not frames or audiolib.is_silent(frames, self.config.silence_rms_threshold):
                 self.notify("info", "Пустая запись — пропускаю")
                 self.state.reset()
-                return None
+                return None, False
 
             duration = audiolib.frames_to_seconds(frames, self.config.sample_rate)
             wav_path = self._wav_from_frames(frames)
@@ -58,7 +58,7 @@ class VoicePipeline:
                 tr = self.provider.transcribe(
                     wav_path, model=self.config.model, language=self.config.language)
             except ProviderError as exc:
-                return self._handle_provider_error(exc, duration, stored_audio)
+                return self._handle_provider_error(exc, duration, stored_audio), False
             finally:
                 try:
                     os.remove(wav_path)
@@ -69,7 +69,7 @@ class VoicePipeline:
             if not text:
                 self.notify("info", "Пустой результат распознавания")
                 self.state.reset()
-                return None
+                return None, False
 
             rid = self.storage.add(text=text, provider=self.provider.name,
                                    model=self.config.model, duration=duration,
@@ -77,9 +77,9 @@ class VoicePipeline:
             self.state.begin_injecting()
             ok = self.injector.inject(target, text)
             if not ok:
-                self.notify("warn", "Не удалось вставить — текст в буфере обмена.")
+                self.notify("warn", "Нет активного поля для вставки — текст скопирован в буфер.")
             self.state.reset()
-            return rid
+            return rid, ok
         except Exception as exc:
             log.exception("pipeline.process failed")
             self.notify("error", f"Сбой: {exc}")
@@ -87,7 +87,7 @@ class VoicePipeline:
                 self.state.fail()
             finally:
                 self.state.reset()
-            return None
+            return None, False
 
     def _handle_provider_error(self, exc: ProviderError, duration, stored_audio):
         log.error("provider error (transient=%s): %s",

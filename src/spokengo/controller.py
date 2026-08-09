@@ -42,14 +42,18 @@ def _default_injector_factory(cfg: Config):
 
 def _default_recorder_factory(cfg: Config):
     from .audio import AudioRecorder
-    return AudioRecorder(cfg.sample_rate, cfg.max_seconds)
+    # local Whisper has no server-side size limit — disable the auto-stop guard
+    max_sec = 0 if cfg.provider == "local" else cfg.max_seconds
+    return AudioRecorder(cfg.sample_rate, max_sec)
 
 
 def _default_provider_factory(cfg: Config):
+    from .transcribe import get_provider
+    if cfg.provider == "local":
+        return get_provider("local")(cfg.local_model)
     key = get_key(cfg.provider)
     if not key:
         raise RuntimeError(f"API-ключ для '{cfg.provider}' не задан")
-    from .transcribe import get_provider
     return get_provider(cfg.provider)(key)
 
 
@@ -74,6 +78,8 @@ class GuiController:
         self.on_recording_started = None  # GUI hook: register Enter/Esc
         self.on_recording_stopped = None  # GUI hook: unregister Enter/Esc
         self.on_status: Optional[Callable[[State, str], None]] = None
+        self.on_cancelled: Optional[Callable[[int], None]] = None  # hook: (rid,)
+        self._cancel_timers: dict = {}
 
     # --- helpers -------------------------------------------------------
     def has_key(self) -> bool:
@@ -115,13 +121,17 @@ class GuiController:
 
     # --- settings ------------------------------------------------------
     def save_settings(self, *, hotkey=None, mode=None, model=None, language=None,
-                      provider=None, store_audio=None, api_key=None) -> None:
+                      provider=None, store_audio=None, api_key=None,
+                      local_model=None, max_seconds=None, max_storage_mb=None) -> None:
         if hotkey is not None: self.cfg.hotkey = hotkey
         if mode is not None: self.cfg.mode = mode
         if model is not None: self.cfg.model = model
         if language is not None: self.cfg.language = (language or None)
         if provider is not None: self.cfg.provider = provider
         if store_audio is not None: self.cfg.store_audio = store_audio
+        if local_model is not None: self.cfg.local_model = local_model
+        if max_seconds is not None: self.cfg.max_seconds = max_seconds
+        if max_storage_mb is not None: self.cfg.max_storage_mb = max_storage_mb
         self.cfg.validate()
         save_config(self.cfg, self.root_dir / "config.toml")
         if api_key:  # only overwrite the stored key when a new one is supplied
@@ -167,6 +177,10 @@ class GuiController:
         self._emit("Повтор: готово" if ok else "Повтор не удался — проверьте сеть/VPN")
         return ok
 
+    def clear_history(self) -> None:
+        self.storage.clear_all()
+        self._emit("История очищена")
+
     def retry_queue(self) -> int:
         """Manually retry queued (transient-failure) recordings. Bounded."""
         try:
@@ -202,7 +216,7 @@ class GuiController:
             self.overlay.show(self._target)
             if self.on_recording_started:
                 self.on_recording_started()   # GUI registers Enter/Esc
-            self._emit("Запись… Enter — стоп, Esc — отмена")
+            self._emit("Запись…")
             return True
         except Exception as exc:
             log.exception("start_recording failed")
@@ -215,21 +229,67 @@ class GuiController:
         self._finish_recording()
 
     def cancel_recording(self) -> None:
-        """Discard the current recording without transcribing (Esc)."""
+        """Cancel current recording — saves to history; audio purged after 60 s."""
         with self._stop_lock:
             if self.state.state is not State.RECORDING:
                 return
             rec, self._recorder = self._recorder, None
             self.state.reset()
+        frames = None
         if rec is not None:
             try:
-                rec.stop()
+                frames = rec.stop()
             except Exception:
                 pass
         self.overlay.hide()
         if self.on_recording_stopped:
             self.on_recording_stopped()
-        self._emit("Отменено")
+        self._save_cancelled(frames)
+
+    def _save_cancelled(self, frames: Optional[bytes]) -> None:
+        import os, tempfile, threading
+        from . import audio as audiolib
+        from .storage import STATUS_CANCELLED
+        try:
+            wav_path = None
+            if self.cfg.store_audio and frames:
+                fd, tmp = tempfile.mkstemp(suffix=".wav")
+                os.close(fd)
+                try:
+                    audiolib.write_wav(frames, self.cfg.sample_rate, tmp)
+                    with open(tmp, "rb") as f:
+                        wav_path = self.storage.save_audio(f.read())
+                finally:
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+            dur = len(frames) / (self.cfg.sample_rate * 2) if frames else 0.0
+            rid = self.storage.add(text="", provider="", model="",
+                                   duration=dur, audio_path=wav_path,
+                                   status=STATUS_CANCELLED)
+            if wav_path:
+                def _cleanup():
+                    self.storage.clear_audio(rid)
+                    self._cancel_timers.pop(rid, None)
+                t = threading.Timer(60, _cleanup)
+                t.daemon = True
+                self._cancel_timers[rid] = t
+                t.start()
+            if self.on_cancelled:
+                self.on_cancelled(rid)
+            self._emit("Запись отменена — аудио ещё 60 с" if wav_path else "Отменено")
+        except Exception:
+            log.exception("_save_cancelled failed")
+            self._emit("Отменено")
+
+    def keep_cancelled(self, rid: int) -> None:
+        """Cancel the 60-s audio purge; convert record to pending for retry."""
+        t = self._cancel_timers.pop(rid, None)
+        if t:
+            t.cancel()
+        self.storage.reset_pending(rid)
+        self._emit("Аудио сохранено — нажмите «Повторить» для распознавания")
 
     def _on_autostop(self) -> None:
         """Called from the audio thread when the duration limit is reached."""
@@ -243,10 +303,6 @@ class GuiController:
             rec, self._recorder = self._recorder, None
             if rec is None:
                 return
-        try:
-            self._target = self._injector_obj().capture_target()  # target = NOW
-        except Exception:
-            pass
         if self.on_recording_stopped:
             self.on_recording_stopped()       # GUI unregisters Enter/Esc
         self.overlay.set_state(State.TRANSCRIBING, "Распознаю…")
@@ -273,16 +329,24 @@ class GuiController:
         pipe = VoicePipeline(state=self.state, storage=self.storage,
                              injector=self._injector_obj(), provider=provider,
                              config=self.cfg, notify=lambda lvl, msg: self._emit(msg))
-        rid = pipe.process(frames, self._target)
-        if rid:
-            rec = self.storage.get(rid)
-            if rec and rec.text:
-                self._emit(f"Готово: {rec.text[:60]}")
-        if self.state.state is not State.IDLE:
-            self.state.reset()
-        self._emit_idle()
+        idle_msg = "Готов. Нажмите Запись или Ctrl+Space"
+        try:
+            rid, inject_ok = pipe.process(frames, self._target)
+            if rid and not inject_ok:
+                rec = self.storage.get(rid)
+                if rec and rec.text:
+                    idle_msg = f"Сохранено в историю: {rec.text[:80]}"
+            if self.cfg.max_storage_mb > 0:
+                self.storage.evict_oldest(self.cfg.max_storage_mb)
+        except Exception as exc:
+            log.exception("_process: unexpected error")
+            self._emit(f"Неожиданная ошибка: {exc}")
+        finally:
+            if self.state.state is not State.IDLE:
+                self.state.reset()
+            self._emit_idle(idle_msg)
 
-    def _emit_idle(self) -> None:
+    def _emit_idle(self, message: str = "Готов. Нажмите Запись или Ctrl+Space") -> None:
         self.overlay.hide()
         if self.on_status:
-            self.on_status(State.IDLE, "Готов. Нажмите Запись или Ctrl+Space")
+            self.on_status(State.IDLE, message)

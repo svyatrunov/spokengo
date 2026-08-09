@@ -66,8 +66,32 @@ class WindowsInjector:  # pragma: no cover - needs Windows
         title = win32gui.GetWindowText(hwnd) if hwnd else ""
         is_app = title not in _SHELL_TITLES
         proc = get_process_name(hwnd) if hwnd else ""
+        child = self._focused_child(hwnd) if hwnd and is_app else None
         return Target(handle=hwnd or None, title=title, is_app=is_app,
-                      process_name=proc)
+                      process_name=proc, focused_child=child)
+
+    def _focused_child(self, hwnd: int) -> "Optional[int]":
+        """Return the focused child control inside *hwnd*'s thread (cross-process).
+        For browsers this gives the RenderWidgetHostHWND of the active tab so we
+        can re-focus the exact tab after a tab-switch mid-recording."""
+        try:
+            import ctypes
+            import win32gui
+            import win32process
+            tgt_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
+            cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
+            user32 = ctypes.windll.user32
+            attached = False
+            if cur_tid != tgt_tid:
+                attached = bool(user32.AttachThreadInput(cur_tid, tgt_tid, True))
+            try:
+                child = win32gui.GetFocus()
+                return child if child and child != hwnd else None
+            finally:
+                if attached:
+                    user32.AttachThreadInput(cur_tid, tgt_tid, False)
+        except Exception:
+            return None
 
     def capture_target(self) -> Target:
         cur = self._foreground()
@@ -124,6 +148,28 @@ class WindowsInjector:  # pragma: no cover - needs Windows
             time.sleep(0.02)
         time.sleep(0.06)  # let focus + the focused control settle
 
+        # Re-focus the specific child control captured at recording start
+        # (e.g. Chrome's RenderWidgetHostHWND for the tab that was active).
+        # This makes tab-switch work: the right tab re-activates so Ctrl+V lands
+        # in the original text field rather than wherever focus wandered to.
+        child = getattr(target, "focused_child", None)
+        if child:
+            try:
+                tgt_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
+                cur_tid_now = win32process.GetWindowThreadProcessId(
+                    win32gui.GetForegroundWindow())[0] if win32gui.GetForegroundWindow() else 0
+                attached2 = False
+                if cur_tid_now and cur_tid_now != tgt_tid:
+                    attached2 = bool(user32.AttachThreadInput(cur_tid_now, tgt_tid, True))
+                try:
+                    user32.SetFocus(child)
+                finally:
+                    if attached2:
+                        user32.AttachThreadInput(cur_tid_now, tgt_tid, False)
+                time.sleep(0.05)  # let the child control settle before Ctrl+V
+            except Exception:
+                pass
+
     # --- injection -----------------------------------------------------
     def _send_paste(self) -> None:
         import win32api
@@ -166,14 +212,14 @@ class WindowsInjector:  # pragma: no cover - needs Windows
     def inject(self, target: Target, text: str) -> bool:
         if not text:
             return False
-        # No real target window -> can't paste anywhere. Put the text on the
-        # clipboard so the user can Ctrl+V it, and report failure so the caller
-        # notifies them. Nothing is lost.
-        if target is None or getattr(target, "handle", None) is None:
-            try:
-                self._clip.set_text(text)
-            except Exception:
-                pass
+        # Always put transcript on clipboard up-front so the user can Ctrl+V
+        # it manually even if focus restoration into the original field fails.
+        try:
+            self._clip.set_text(text)
+        except Exception:
+            pass
+        if (target is None or not getattr(target, "handle", None)
+                or not getattr(target, "is_app", True)):
             return False
         self._focus(target)
         try:
@@ -181,7 +227,10 @@ class WindowsInjector:  # pragma: no cover - needs Windows
             return True
         except Exception:
             if self.fallback_typing:
-                self.type_text(text)
+                try:
+                    self.type_text(text)
+                except Exception:
+                    pass
             return True
 
 

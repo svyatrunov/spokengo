@@ -84,13 +84,16 @@ class AudioRecorder:
         if self._autostop_fired.is_set():
             return  # already stopping — ignore further blocks (no flood)
         self._buffer.add(bytes(indata))
-        if exceeds_limit(self._buffer.bytes(), self.sample_rate, self.max_seconds):
-            # set the flag FIRST so concurrent callbacks bail, then fire once
+        if (self.max_seconds
+                and exceeds_limit(self._buffer.bytes(), self.sample_rate, self.max_seconds)):
+            # set the flag FIRST so concurrent callbacks bail, then fire once.
+            # NEVER call stream.stop() from within the PortAudio callback — it is
+            # forbidden by the PortAudio API and crashes. Dispatch to a new thread.
             if not self._autostop_fired.is_set():
                 self._autostop_fired.set()
                 cb = self._on_autostop
                 if cb:
-                    cb()
+                    threading.Thread(target=cb, daemon=True).start()
 
     def start(self, on_autostop=None) -> None:  # pragma: no cover - needs device
         try:

@@ -14,6 +14,7 @@ from typing import List, Optional
 STATUS_DONE = "done"
 STATUS_PENDING = "pending"   # transient failure, eligible for manual retry
 STATUS_FAILED = "failed"     # permanent failure or retries exhausted
+STATUS_CANCELLED = "cancelled"  # user-cancelled; audio held briefly then purged
 
 
 @dataclass
@@ -138,6 +139,67 @@ class Storage:
             id=r["id"], ts=r["ts"], text=r["text"], provider=r["provider"],
             model=r["model"], duration=r["duration"], audio_path=r["audio_path"],
             status=r["status"], attempts=r["attempts"] if "attempts" in keys else 0)
+
+    def clear_audio(self, rec_id: int) -> None:
+        row = self._conn.execute(
+            "SELECT audio_path FROM transcripts WHERE id=?", (rec_id,)).fetchone()
+        if row and row["audio_path"]:
+            try:
+                os.remove(row["audio_path"])
+            except OSError:
+                pass
+        self._conn.execute("UPDATE transcripts SET audio_path=NULL WHERE id=?", (rec_id,))
+        self._conn.commit()
+
+    def clear_all(self) -> None:
+        rows = self._conn.execute(
+            "SELECT audio_path FROM transcripts WHERE audio_path IS NOT NULL").fetchall()
+        for r in rows:
+            p = r["audio_path"]
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        self._conn.execute("DELETE FROM transcripts")
+        self._conn.commit()
+
+    def audio_size_mb(self) -> float:
+        """Total size of all stored audio files in MB."""
+        rows = self._conn.execute(
+            "SELECT audio_path FROM transcripts WHERE audio_path IS NOT NULL").fetchall()
+        total = 0
+        for r in rows:
+            p = r["audio_path"]
+            if p:
+                try:
+                    total += os.path.getsize(p)
+                except OSError:
+                    pass
+        return total / (1024 * 1024)
+
+    def evict_oldest(self, max_mb: float) -> int:
+        """Delete oldest records (audio + row) until total audio is under max_mb.
+        Returns number of records deleted. No-op when max_mb <= 0."""
+        if max_mb <= 0:
+            return 0
+        deleted = 0
+        while self.audio_size_mb() > max_mb:
+            row = self._conn.execute(
+                "SELECT id, audio_path FROM transcripts"
+                " WHERE audio_path IS NOT NULL ORDER BY ts ASC LIMIT 1").fetchone()
+            if row is None:
+                break
+            p = row["audio_path"]
+            if p:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            self._conn.execute("DELETE FROM transcripts WHERE id=?", (row["id"],))
+            self._conn.commit()
+            deleted += 1
+        return deleted
 
     def close(self) -> None:
         self._conn.close()

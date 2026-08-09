@@ -42,6 +42,8 @@ class Config:
     inject_fallback_typing: bool = True   # type char-by-char if paste fails
     restore_clipboard: bool = False       # False = keep last transcript on clipboard (Ctrl+V works anywhere)
     auto_retry: bool = False              # background retry of the offline queue (off by default)
+    local_model: str = ""                 # absolute path to a faster-whisper snapshot dir; "" = auto-detect
+    max_storage_mb: int = 0              # audio storage quota in MB; 0 = unlimited
 
     @classmethod
     def _known(cls) -> set[str]:
@@ -62,6 +64,8 @@ class Config:
             raise ConfigError("sample_rate must be positive")
         if self.max_seconds <= 0:
             raise ConfigError("max_seconds must be positive")
+        if self.max_storage_mb < 0:
+            raise ConfigError("max_storage_mb must be ≥ 0 (0 = unlimited)")
 
     def to_toml(self) -> str:
         lines = ["# SpokenGo config. The API key is NOT here (it is in the OS",
@@ -72,7 +76,8 @@ class Config:
             elif isinstance(v, bool):
                 lines.append(f"{k} = {str(v).lower()}")
             elif isinstance(v, str):
-                lines.append(f'{k} = "{v}"')
+                escaped = v.replace("\\", "\\\\")
+                lines.append(f'{k} = "{escaped}"')
             else:
                 lines.append(f"{k} = {v}")
         return "\n".join(lines) + "\n"

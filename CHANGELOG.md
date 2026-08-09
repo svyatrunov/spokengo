@@ -3,6 +3,12 @@
 All notable changes are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.10.0
+
+- **Local mode** — transcribe offline with [faster-whisper](https://github.com/SYSTRAN/faster-whisper): no API key, no internet. Switch between cloud and local in one click (Settings → Провайдер). Models are auto-detected from the HuggingFace hub cache.
+- **Desktop shortcut** — `spokengo install` creates a Desktop shortcut with a custom icon; `--icon logo.png` converts any image to `.ico` automatically. The shortcut is also created silently on the first GUI launch.
+- **App icon** — new microphone icon (purple gradient, all six sizes: 16 / 32 / 48 / 64 / 128 / 256 px).
+
 ## 0.9.0
 
 - Reliability: dictations are never lost. The last transcript stays on the

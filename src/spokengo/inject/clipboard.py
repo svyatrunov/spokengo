@@ -46,7 +46,15 @@ class ClipboardCycle:
         if not text:
             return False
 
-        original = self._with_retry(self.backend.get_text)
+        # Read the old clipboard ONLY when we intend to restore it — a locked
+        # clipboard here must NOT block the transcript from landing on the
+        # clipboard (that's the minimum guarantee the user can rely on).
+        original: Optional[str] = None
+        if restore:
+            try:
+                original = self._with_retry(self.backend.get_text)
+            except Exception:
+                pass  # can't read old value; we'll skip restoration
 
         def _set_and_verify():
             self.backend.set_text(text)
@@ -56,11 +64,14 @@ class ClipboardCycle:
 
         self._with_retry(_set_and_verify)   # ensures our text is really there
         do_paste()                           # paste only after verification
-        if restore:
+        if restore and original is not None:
             # Give the target time to actually consume the paste before we put
             # the user's old clipboard back (otherwise it pastes the old text).
             self._sleep(self.restore_delay)
-            self._with_retry(lambda: self.backend.set_text(original or ""))
+            try:
+                self._with_retry(lambda: self.backend.set_text(original or ""))
+            except Exception:
+                pass  # restoration failure is non-fatal; transcript is better than nothing
         # When restore is False we deliberately LEAVE the transcript on the
         # clipboard, so the user can Ctrl+V it again anywhere — nothing is lost.
         return True

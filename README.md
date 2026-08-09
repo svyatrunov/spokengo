@@ -6,7 +6,7 @@
 
 <p align="center">
   Voice input into <b>any</b> text field, anywhere on Windows.<br>
-  Press your hotkey → speak → it transcribes (Groq Whisper) and pastes into the field you were in.
+  Press your hotkey → speak → transcribed text is pasted where your cursor was.
 </p>
 
 <p align="center">
@@ -20,20 +20,22 @@
 
 ## Features
 
-- **Works in any field** — chat, browser, editor, address bars. No per-app setup.
-- **Global hotkey** — start with `Ctrl+Space` (configurable by pressing a key combo), **stop with `Enter`**, **cancel with `Esc`**.
-- **Live indicator** — a small floating pill shows it's recording and *which app* the text will land in.
-- **Local & private** — audio + history stay on your machine; the API key lives in the Windows Credential Manager, never in a file.
-- **Pluggable models** — ships with Groq Whisper; adding another provider is one class.
-- **No runaway costs** — silence is skipped, one request per dictation, failed items aren't auto-retried.
+- **Works in any field** — chat, browser, editor, terminal, address bar. No per-app setup.
+- **Global hotkey** — start with `Ctrl+Space` (configurable), **stop with `Enter`**, **cancel with `Esc`**.
+- **Two transcription modes** — cloud via Groq Whisper API, or fully offline via a local faster-whisper model (switch in one click, no restart).
+- **Live overlay** — a floating pill shows it's recording and *which app* text will land in.
+- **Nothing is lost** — last transcript stays on the clipboard, History has one-click copy and per-item retry, failed items are queued for later.
+- **Private by default** — audio and history stay on your machine; API key lives in Windows Credential Manager, never in a file.
 
 <p align="center">
-  <img src="assets/screenshot.png" width="620" alt="SpokenGo record button and recording overlay">
+  <img src="assets/screenshot.png" width="620" alt="SpokenGo control panel and recording overlay">
 </p>
+
+---
 
 ## Install (Windows)
 
-You need [Python 3.10+](https://www.python.org/downloads/) (tick *Add to PATH* during install).
+You need [Python 3.10+](https://www.python.org/downloads/) — tick **Add to PATH** during install.
 
 ```powershell
 git clone https://github.com/svyatrunov/SpokenGo.git
@@ -41,21 +43,70 @@ cd SpokenGo
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
-The installer sets everything up in an isolated `.venv` and puts a **SpokenGo icon on your Desktop and Start Menu** — launch it like a normal app. No terminal, no `.exe` to trust.
+The installer:
+1. Creates an isolated `.venv`
+2. Installs SpokenGo and all runtime dependencies
+3. Asks for your Groq API key (optional — you can add it later)
+4. Puts a **SpokenGo shortcut** on your Desktop and in the Start Menu
 
-> Why no prebuilt `.exe`? Unsigned executables trip SmartScreen/antivirus and ask people to trust a binary. Installing from source into a venv is safer and fully transparent.
+After that just double-click the icon — no terminal needed.
 
-## Get a Groq API key
+> **Why no `.exe`?** Unsigned executables trigger SmartScreen / antivirus. Installing from source into a venv is safer and fully transparent.
 
-1. Open **https://console.groq.com/keys** and create a key (free tier available).
-2. Paste it when the installer asks — or later in the app: **Settings → API key → Save**.
+---
 
-The key is stored in the Windows Credential Manager (service `SpokenGo`), not on disk.
+## Groq API key (cloud mode)
 
-## Run it like a normal app (no console)
+1. Open [console.groq.com/keys](https://console.groq.com/keys) and create a key — free tier is generous.
+2. Paste it in the app: **Settings → API key → Save**.
 
-`scripts\install.ps1` already creates a **Desktop + Start Menu shortcut** that
-launches SpokenGo windowed (no terminal). Just double-click it.
+The key is stored in Windows Credential Manager (service `SpokenGo`), never on disk.
+
+---
+
+## Local mode (offline, no API key)
+
+SpokenGo can transcribe entirely on your machine using [faster-whisper](https://github.com/SYSTRAN/faster-whisper). No internet connection or API key required.
+
+**Step 1 — install the library** (once, into the same environment as SpokenGo):
+
+```powershell
+.venv\Scripts\pip install faster-whisper
+```
+
+**Step 2 — download a model:**
+
+```powershell
+.venv\Scripts\huggingface-cli download Systran/faster-whisper-medium
+```
+
+Models are cached in `~/.cache/huggingface/hub/`. Available sizes:
+
+| Model | Size | Speed | Accuracy |
+|---|---|---|---|
+| `Systran/faster-whisper-tiny` | ~75 MB | fastest | lower |
+| `Systran/faster-whisper-base` | ~145 MB | fast | good |
+| `Systran/faster-whisper-small` | ~465 MB | good | good |
+| `Systran/faster-whisper-medium` | ~1.5 GB | moderate | **great** |
+| `Systran/faster-whisper-large-v3` | ~3 GB | slow | best |
+
+**Step 3 — switch in the app:**
+
+Open **Settings → Провайдер → 🖥 Локально**. SpokenGo auto-detects the downloaded model and switches immediately. Switch back to ☁ Groq any time.
+
+> Runs on CPU by default (`int8` quantization). No GPU required.
+
+---
+
+## Usage
+
+| Action | Key |
+|---|---|
+| Start recording | `Ctrl+Space` (or your combo) |
+| Stop & paste | `Enter` |
+| Cancel | `Esc` |
+
+Press the hotkey anywhere, speak, press `Enter`. Text is pasted into the focused field. The **Record** button in the window does the same thing.
 
 ### Start automatically at login
 
@@ -63,42 +114,51 @@ launches SpokenGo windowed (no terminal). Just double-click it.
 powershell -ExecutionPolicy Bypass -File scripts\autostart.ps1
 ```
 
-This adds SpokenGo to your Startup folder (windowed, no console). Undo with:
+Undo with `scripts\autostart.ps1 -Remove`. A single-instance guard prevents double-launch.
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\autostart.ps1 -Remove
-```
-
-A single-instance guard means it never launches twice.
-
-## Usage
-
-| Action | Key |
-| --- | --- |
-| Start recording | `Ctrl+Space` (or your own combo) |
-| Stop & insert | `Enter` |
-| Cancel | `Esc` |
-
-Press the hotkey anywhere, speak, press `Enter`. The text is pasted into whatever field is focused. The window's **Record** button does the same.
+---
 
 ## Privacy & security
 
-- **API key**: stored in Windows Credential Manager via [`keyring`](https://pypi.org/project/keyring/) — not in config files or the repo.
-- **Your data**: recordings and transcript history are stored locally under `%APPDATA%\SpokenGo` and can be auto-deleted (configurable). Audio storage can be turned off entirely.
-- **Network**: the app talks to exactly one endpoint — `api.groq.com` — to transcribe. Nothing else.
-- **No telemetry**, no analytics, no background calls. Failed transcriptions are retried only when you press *Retry*.
-- The last transcript stays on your clipboard, so you can paste it again anywhere even if the paste missed (set `restore_clipboard = true` in the config to restore your previous clipboard instead).
+| What | Where |
+|---|---|
+| API key | Windows Credential Manager — never in files or the repo |
+| Audio recordings | `%APPDATA%\SpokenGo\` — local only, auto-deleted after N days (configurable) |
+| Transcript history | `%APPDATA%\SpokenGo\` — local only |
+| Network (cloud mode) | One endpoint only: `api.groq.com` |
+| Network (local mode) | None — transcription runs entirely on your machine |
 
-See [docs/BUGS.md](docs/BUGS.md) for the full list of edge cases handled, and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design.
+No telemetry. No analytics. No background calls. Failed transcriptions are retried only when you press **Retry**.
+
+The last transcript stays on the clipboard so you can paste it again anywhere even if the first paste missed. Set `restore_clipboard = true` in the config to restore your previous clipboard instead.
+
+---
+
+## CLI
+
+```
+spokengo                         # open the control panel (default)
+spokengo gui                     # same, explicit
+spokengo run                     # headless mode (hotkey only, no window)
+spokengo install                 # (re)create the Desktop shortcut
+spokengo install --icon logo.png # use a custom icon (.ico / .png / .jpg)
+spokengo install --start-menu    # also add to Start Menu
+spokengo set-key groq <KEY>      # store a Groq API key
+spokengo history                 # print recent transcripts
+spokengo logs -n 50              # view log file (for troubleshooting)
+spokengo --version
+```
+
+---
 
 ## Development
 
 ```bash
 pip install -e ".[dev]"
-pytest            # 86 tests, run on Linux/macOS/Windows without hardware
+pytest            # 91 tests, run on any OS without hardware
 ```
 
-The platform layer (win32 injection, microphone, global hotkeys, the layered overlay) is isolated behind interfaces and mocked in tests, so the entire core — state machine, clipboard cycle, providers, queue, storage — is tested without Windows or a network. CI runs the suite on Python 3.10–3.12.
+The platform layer (win32 injection, microphone, global hotkeys, overlay window) is isolated behind interfaces and mocked in tests — the entire core (state machine, providers, queue, storage, clipboard cycle) is tested without Windows or a network connection.
 
 ### Add a transcription provider
 
@@ -108,26 +168,20 @@ from spokengo.transcribe.base import Transcript
 
 @register_provider("openai")
 class OpenAIProvider:
+    name = "openai"
     def __init__(self, api_key): ...
-    def transcribe(self, audio_path, *, model, language=None) -> Transcript:
-        ...
+    def transcribe(self, audio_path, *, model, language=None) -> Transcript: ...
 ```
 
-Then set `provider = "openai"` in the config and `spokengo set-key openai <KEY>`.
+Then set `provider = "openai"` in `config.toml` and `spokengo set-key openai <KEY>`.
 
-## CLI
-
-```
-spokengo            # open the window (default)
-spokengo set-key groq <KEY>
-spokengo logs -n 40 # view the log (for troubleshooting)
-spokengo history
-spokengo --version
-```
+---
 
 ## Contributing
 
-Issues and PRs welcome — new providers, packaging for macOS/Linux, and UI polish especially. Please run `pytest` before opening a PR.
+Issues and PRs are welcome — new providers, macOS/Linux support, UI polish. Please run `pytest` before opening a PR.
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, [docs/BUGS.md](docs/BUGS.md) for edge cases handled.
 
 ## License
 
