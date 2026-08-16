@@ -23,6 +23,9 @@ from .storage import Record, Storage
 
 log = logging.getLogger("spokengo.controller")
 
+# How often the watchdog checks whether a transcription worker is still alive.
+WATCHDOG_POLL_S = 5.0
+
 
 class _NullInjector:
     def capture_target(self):
@@ -74,6 +77,8 @@ class GuiController:
         self._recorder = None
         self._target = None
         self._stop_lock = threading.Lock()
+        self._worker: Optional[threading.Thread] = None
+        self._watchdog: Optional[threading.Timer] = None
         self.overlay = NullOverlay()  # set to a TkOverlay by the GUI
         self.on_recording_started = None  # GUI hook: register Enter/Esc
         self.on_recording_stopped = None  # GUI hook: unregister Enter/Esc
@@ -203,6 +208,12 @@ class GuiController:
         if self.state.state is State.RECORDING:
             self.stop_recording()
             return "stop"
+        # TRANSCRIBING/INJECTING/ERROR with no live worker means we are wedged —
+        # the button is the user's escape hatch, so recover instead of ignoring.
+        w = self._worker
+        if w is None or not w.is_alive():
+            self.force_reset()
+            return "reset"
         return "ignored"
 
     def start_recording(self) -> bool:
@@ -211,8 +222,25 @@ class GuiController:
             return False
         try:
             self._target = self._injector_obj().capture_target()
-            self._recorder = self._recorder_factory(self.cfg)
-            self._recorder.start(on_autostop=self._on_autostop)
+            rec = self._recorder_factory(self.cfg)
+            rec.start(on_autostop=self._on_autostop)
+            # Publish the recorder only once it is actually capturing. A stop
+            # arriving before this point finds _recorder = None; _finish_recording
+            # unwedges the state, and the check below closes the stream we just
+            # opened instead of leaving the mic hot with nobody to stop it.
+            with self._stop_lock:
+                if self.state.state is not State.RECORDING:
+                    stale = True
+                else:
+                    self._recorder, stale = rec, False
+            if stale:
+                try:
+                    rec.stop()
+                except Exception:
+                    pass
+                self.overlay.hide()
+                self._emit_idle("Запись отменена до старта")
+                return False
             self.overlay.show(self._target)
             if self.on_recording_started:
                 self.on_recording_started()   # GUI registers Enter/Esc
@@ -220,6 +248,8 @@ class GuiController:
             return True
         except Exception as exc:
             log.exception("start_recording failed")
+            with self._stop_lock:
+                self._recorder = None
             self.state.fail(); self.state.reset()
             self.overlay.hide()
             self._emit(f"Не удалось начать запись: {exc}")
@@ -296,13 +326,73 @@ class GuiController:
         self._emit("Достигнут лимит длительности — останавливаю")
         self._finish_recording()
 
+    def _arm_watchdog(self, worker: threading.Thread) -> None:
+        """Last-resort unwedge. If the transcription worker dies without
+        restoring IDLE (an unexpected crash, a killed thread), the app would sit
+        in TRANSCRIBING and ignore every hotkey. Poll the worker and force the
+        state back so the user is never stuck without a restart."""
+        def _check():
+            if worker.is_alive():
+                t = threading.Timer(WATCHDOG_POLL_S, _check)
+                t.daemon = True
+                self._watchdog = t
+                t.start()
+                return
+            if self.state.state is not State.IDLE:
+                log.warning("watchdog: worker died in %s — forcing IDLE",
+                            self.state.state.value)
+                try:
+                    self.state.fail()
+                finally:
+                    self.state.reset()
+                self._emit_idle("Распознавание прервалось — запись в истории")
+        t = threading.Timer(WATCHDOG_POLL_S, _check)
+        t.daemon = True
+        self._watchdog = t
+        t.start()
+
+    def force_reset(self) -> None:
+        """Manual escape hatch: drop any half-finished state back to IDLE."""
+        with self._stop_lock:
+            rec, self._recorder = self._recorder, None
+        if rec is not None:
+            try:
+                rec.stop()
+            except Exception:
+                pass
+        if self.on_recording_stopped:
+            self.on_recording_stopped()
+        if self.state.state is not State.IDLE:
+            try:
+                self.state.fail()
+            finally:
+                self.state.reset()
+        self._emit_idle()
+
     def _finish_recording(self) -> None:
         with self._stop_lock:
+            # Whether *we* are the edge that ends the recording. ensure_transcribing
+            # also returns True for an already-transcribing state, so it alone
+            # cannot tell a first stop from a duplicate one.
+            was_recording = self.state.state is State.RECORDING
             if not self.state.ensure_transcribing():
                 return  # not recording -> ignore (idempotent, kills the flood)
             rec, self._recorder = self._recorder, None
-            if rec is None:
-                return
+            if rec is None and not was_recording:
+                return  # duplicate stop; the first one owns this transcription
+            orphaned = rec is None
+            if orphaned:
+                self.state.reset()      # hand TRANSCRIBING back before we bail
+        if orphaned:
+            # We ended the recording but there is no recorder to stop — the start
+            # path had not attached one yet. Returning without the reset above
+            # would park the state machine in TRANSCRIBING forever: every later
+            # Enter/hotkey/button press is then silently ignored (neither IDLE
+            # nor RECORDING) and the app is dead until restart.
+            if self.on_recording_stopped:
+                self.on_recording_stopped()
+            self._emit_idle("Запись не началась — попробуйте ещё раз")
+            return
         if self.on_recording_stopped:
             self.on_recording_stopped()       # GUI unregisters Enter/Esc
         self.overlay.set_state(State.TRANSCRIBING, "Распознаю…")
@@ -314,7 +404,10 @@ class GuiController:
             self.overlay.hide()
             self._emit(f"Ошибка записи: {exc}")
             return
-        threading.Thread(target=self._process, args=(frames,), daemon=True).start()
+        worker = threading.Thread(target=self._process, args=(frames,), daemon=True)
+        self._worker = worker
+        worker.start()
+        self._arm_watchdog(worker)
 
     def _process(self, frames: bytes) -> None:
         from .pipeline import VoicePipeline

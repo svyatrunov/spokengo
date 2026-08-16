@@ -723,15 +723,19 @@ class ControlPanel:
     def _register_rec_keys(self):
         if not self._hk:
             return
-        try:
-            self._rec_hk_ids = [
-                self._hk.register(self.ctrl.cfg.stop_key,
-                                  lambda: self.root.after(0, self.ctrl.stop_recording)),
-                self._hk.register(self.ctrl.cfg.cancel_key,
-                                  lambda: self.root.after(0, self.ctrl.cancel_recording)),
-            ]
-        except Exception:
-            self._rec_hk_ids = []
+        # Stale ids would keep Enter/Esc grabbed system-wide and make the next
+        # RegisterHotKey fail (the combo is already owned by our thread), which
+        # left Enter unable to stop a recording. Always clear before re-arming,
+        # and record each id as it is created so a partial failure still unwinds.
+        self._unregister_rec_keys()
+        for combo, action in ((self.ctrl.cfg.stop_key, self.ctrl.stop_recording),
+                              (self.ctrl.cfg.cancel_key, self.ctrl.cancel_recording)):
+            try:
+                self._rec_hk_ids.append(
+                    self._hk.register(combo, lambda a=action: self.root.after(0, a)))
+            except Exception:
+                self._set_status_text(
+                    f"«{combo}» не удалось назначить — остановите кнопкой в окне")
 
     def _unregister_rec_keys(self):
         if not self._hk:
