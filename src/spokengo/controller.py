@@ -15,6 +15,7 @@ import threading
 from pathlib import Path
 from typing import Callable, List, Optional
 
+from . import focuslog
 from .config import Config, default_config_dir, load_config, save_config
 from .secrets_store import get_key, set_key
 from .overlay import NullOverlay
@@ -70,6 +71,7 @@ class GuiController:
         self.root_dir = Path(root_dir or default_config_dir())
         self.storage = storage or Storage(self.root_dir)
         self.state = StateMachine(mode=self.cfg.mode, debounce_ms=self.cfg.debounce_ms)
+        focuslog.enable(getattr(self.cfg, "debug_focus", False))
         self._injector_factory = injector_factory
         self._recorder_factory = recorder_factory
         self._provider_factory = provider_factory
@@ -156,7 +158,9 @@ class GuiController:
         """Current paste target (foreground app), for the live overlay. Safe to
         call repeatedly; returns None if unavailable."""
         try:
-            return self._injector_obj().capture_target()
+            inj = self._injector_obj()
+            peek = getattr(inj, "peek_target", None)
+            return peek() if peek else inj.capture_target()
         except Exception:
             return None
 
@@ -222,10 +226,12 @@ class GuiController:
 
     def start_recording(self) -> bool:
         """Start-only (the start hotkey / button). Returns True if started."""
+        focuslog.mark("hotkey")             # the caret as the user left it
         if not self.state.try_start():
             return False
         try:
             self._target = self._injector_obj().capture_target()
+            focuslog.mark("after-capture")  # did reading the target cost us focus?
             rec = self._recorder_factory(self.cfg)
             rec.start(on_autostop=self._on_autostop)
             # Publish the recorder only once it is actually capturing. A stop
@@ -250,6 +256,7 @@ class GuiController:
             if self.on_recording_started:
                 self.on_recording_started()   # GUI registers Enter/Esc
             self._emit("Запись…")
+            focuslog.mark("recording")      # steady state while dictating
             return True
         except Exception as exc:
             log.exception("start_recording failed")

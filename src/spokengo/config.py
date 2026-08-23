@@ -44,6 +44,7 @@ class Config:
     auto_retry: bool = False              # background retry of the offline queue (off by default)
     local_model: str = ""                 # absolute path to a faster-whisper snapshot dir; "" = auto-detect
     max_storage_mb: int = 0              # audio storage quota in MB; 0 = unlimited
+    debug_focus: bool = False             # log where the caret is at each step
 
     @classmethod
     def _known(cls) -> set[str]:

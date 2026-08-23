@@ -18,6 +18,7 @@ import time
 from collections import deque
 from typing import Deque, Optional
 
+from .. import focuslog
 from .base import ClipboardBackend, Target
 from .clipboard import ClipboardCycle
 
@@ -59,39 +60,38 @@ class WindowsInjector:  # pragma: no cover - needs Windows
         self.restore_clipboard = restore_clipboard
 
     # --- focus ---------------------------------------------------------
-    def _foreground(self) -> Target:
+    def _foreground(self, with_child: bool = True) -> Target:
         import win32gui
         from .win_icon import get_process_name
         hwnd = win32gui.GetForegroundWindow()
         title = win32gui.GetWindowText(hwnd) if hwnd else ""
         is_app = title not in _SHELL_TITLES
         proc = get_process_name(hwnd) if hwnd else ""
-        child = self._focused_child(hwnd) if hwnd and is_app else None
+        child = self._focused_child(hwnd) if (with_child and hwnd and is_app) else None
         return Target(handle=hwnd or None, title=title, is_app=is_app,
                       process_name=proc, focused_child=child)
 
     def _focused_child(self, hwnd: int) -> "Optional[int]":
         """Return the focused child control inside *hwnd*'s thread (cross-process).
         For browsers this gives the RenderWidgetHostHWND of the active tab so we
-        can re-focus the exact tab after a tab-switch mid-recording."""
+        can re-focus the exact tab after a tab-switch mid-recording.
+
+        Read via GetGUIThreadInfo, never AttachThreadInput. The attach/detach
+        pair clears focus and destroys the caret in the target: pressing the
+        hotkey with a caret in a text field left the user unable to type, because
+        the live overlay polls this path several times a second."""
         try:
-            import ctypes
-            import win32gui
             import win32process
             tgt_tid = win32process.GetWindowThreadProcessId(hwnd)[0]
-            cur_tid = ctypes.windll.kernel32.GetCurrentThreadId()
-            user32 = ctypes.windll.user32
-            attached = False
-            if cur_tid != tgt_tid:
-                attached = bool(user32.AttachThreadInput(cur_tid, tgt_tid, True))
-            try:
-                child = win32gui.GetFocus()
-                return child if child and child != hwnd else None
-            finally:
-                if attached:
-                    user32.AttachThreadInput(cur_tid, tgt_tid, False)
+            child = focuslog.focused_hwnd(tgt_tid)
+            return child if child and child != hwnd else None
         except Exception:
             return None
+
+    def peek_target(self) -> Target:
+        """Cheap read for the live overlay, which polls ~3x a second: it only
+        needs the window identity, so skip the focused-child lookup entirely."""
+        return self._foreground(with_child=False)
 
     def capture_target(self) -> Target:
         cur = self._foreground()

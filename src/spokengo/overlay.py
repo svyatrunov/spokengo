@@ -299,7 +299,9 @@ class TkOverlay:
         self.target_provider: Optional[Callable[[], object]] = None
 
     def show(self, target=None) -> None:
-        self._root.after(0, lambda: self._show(target))
+        from . import focuslog
+        self._root.after(0, lambda: (self._show(target),
+                                     focuslog.mark("after-overlay")))
 
     def set_state(self, state, message: str = "") -> None:
         self._root.after(0, lambda: self._set_state(state))
@@ -400,6 +402,11 @@ class TkOverlay:
             if h != self._handle:
                 self._handle = h
                 self._set_target_visual(t)
+                # Fires only on a real switch, so an Alt+Tab during recording
+                # leaves a trace here. Silence while the user is alt-tabbing
+                # means the switch never happened.
+                from . import focuslog
+                focuslog.mark("target-changed")
         self._root.after(350, self._poll)
 
     def _hide(self):
