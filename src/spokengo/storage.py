@@ -16,6 +16,10 @@ STATUS_PENDING = "pending"   # transient failure, eligible for manual retry
 STATUS_FAILED = "failed"     # permanent failure or retries exhausted
 STATUS_CANCELLED = "cancelled"  # user-cancelled; audio held briefly then purged
 
+# Unreferenced audio younger than this is left alone: save_audio() writes the
+# file before its row exists, and that window must not be treated as garbage.
+ORPHAN_GRACE_S = 300.0
+
 
 @dataclass
 class Record:
@@ -164,25 +168,67 @@ class Storage:
         self._conn.execute("DELETE FROM transcripts")
         self._conn.commit()
 
-    def audio_size_mb(self) -> float:
-        """Total size of all stored audio files in MB."""
-        rows = self._conn.execute(
-            "SELECT audio_path FROM transcripts WHERE audio_path IS NOT NULL").fetchall()
-        total = 0
-        for r in rows:
+    def _audio_files(self):
+        """Every .wav actually sitting in the audio directory."""
+        try:
+            return [p for p in self.audio_dir.iterdir()
+                    if p.is_file() and p.suffix.lower() == ".wav"]
+        except OSError:
+            return []
+
+    def _referenced(self) -> set:
+        out = set()
+        for r in self._conn.execute(
+                "SELECT audio_path FROM transcripts WHERE audio_path IS NOT NULL"):
             p = r["audio_path"]
             if p:
-                try:
-                    total += os.path.getsize(p)
-                except OSError:
-                    pass
+                out.add(os.path.normcase(os.path.abspath(p)))
+        return out
+
+    def audio_size_mb(self) -> float:
+        """Size of the audio directory in MB.
+
+        Measured from the directory, not from audio_path rows. A file whose row
+        never landed — an empty transcription result, a failure between
+        save_audio() and add() — still occupies the user's disk, and a quota
+        blind to those files lets the folder grow without bound: in practice it
+        reached 12x the configured limit while reporting itself just under it.
+        """
+        total = 0
+        for p in self._audio_files():
+            try:
+                total += p.stat().st_size
+            except OSError:
+                pass
         return total / (1024 * 1024)
 
+    def purge_orphans(self, grace_seconds: float = ORPHAN_GRACE_S, now=None) -> int:
+        """Delete audio files no record references. Files younger than
+        ``grace_seconds`` are spared: save_audio() writes the file before its row
+        exists, so deleting inside that window would destroy a live recording."""
+        now = now or time.time()
+        referenced = self._referenced()
+        removed = 0
+        for p in self._audio_files():
+            if os.path.normcase(os.path.abspath(str(p))) in referenced:
+                continue
+            try:
+                if now - p.stat().st_mtime < grace_seconds:
+                    continue
+                p.unlink()
+                removed += 1
+            except OSError:
+                pass
+        return removed
+
     def evict_oldest(self, max_mb: float) -> int:
-        """Delete oldest records (audio + row) until total audio is under max_mb.
-        Returns number of records deleted. No-op when max_mb <= 0."""
+        """Delete oldest records (audio + row) until the audio directory is under
+        max_mb. Returns number of records deleted. No-op when max_mb <= 0."""
         if max_mb <= 0:
             return 0
+        # Unreferenced files first: they count towards the quota, so leaving them
+        # would evict the user's entire history while the real consumers remain.
+        self.purge_orphans()
         deleted = 0
         while self.audio_size_mb() > max_mb:
             row = self._conn.execute(

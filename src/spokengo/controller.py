@@ -79,6 +79,10 @@ class GuiController:
         self._stop_lock = threading.Lock()
         self._worker: Optional[threading.Thread] = None
         self._watchdog: Optional[threading.Timer] = None
+        # Bumped whenever a new record/transcribe cycle begins. A watchdog only
+        # acts while its own generation is still current, so it can never
+        # interfere with work that started after it was armed.
+        self._gen = 0
         self.overlay = NullOverlay()  # set to a TkOverlay by the GUI
         self.on_recording_started = None  # GUI hook: register Enter/Esc
         self.on_recording_stopped = None  # GUI hook: unregister Enter/Esc
@@ -233,6 +237,7 @@ class GuiController:
                     stale = True
                 else:
                     self._recorder, stale = rec, False
+                    self._gen += 1
             if stale:
                 try:
                     rec.stop()
@@ -264,6 +269,7 @@ class GuiController:
             if self.state.state is not State.RECORDING:
                 return
             rec, self._recorder = self._recorder, None
+            self._gen += 1
             self.state.reset()
         frames = None
         if rec is not None:
@@ -326,11 +332,19 @@ class GuiController:
         self._emit("Достигнут лимит длительности — останавливаю")
         self._finish_recording()
 
-    def _arm_watchdog(self, worker: threading.Thread) -> None:
+    def _arm_watchdog(self, worker: threading.Thread, gen: int) -> None:
         """Last-resort unwedge. If the transcription worker dies without
-        restoring IDLE (an unexpected crash, a killed thread), the app would sit
-        in TRANSCRIBING and ignore every hotkey. Poll the worker and force the
-        state back so the user is never stuck without a restart."""
+        restoring IDLE, the app would sit in TRANSCRIBING and ignore every
+        hotkey. Poll the worker and force the state back so the user is never
+        stuck without a restart.
+
+        Two guards keep this from doing harm, both learned the hard way:
+        ``gen`` pins the timer to the cycle it was armed for (otherwise it fires
+        into a *later* recording and aborts it), and RECORDING is never touched
+        because it proves the app is alive. Recovery goes through force_reset so
+        a live capture stream is closed rather than orphaned — a leaked
+        PortAudio stream is finalised by the GC on an arbitrary thread while its
+        callback may still run, which crashes the process outright."""
         def _check():
             if worker.is_alive():
                 t = threading.Timer(WATCHDOG_POLL_S, _check)
@@ -338,22 +352,23 @@ class GuiController:
                 self._watchdog = t
                 t.start()
                 return
-            if self.state.state is not State.IDLE:
-                log.warning("watchdog: worker died in %s — forcing IDLE",
-                            self.state.state.value)
-                try:
-                    self.state.fail()
-                finally:
-                    self.state.reset()
-                self._emit_idle("Распознавание прервалось — запись в истории")
+            if self._gen != gen:
+                return          # a newer cycle owns the app now — not ours to touch
+            st = self.state.state
+            if st is State.IDLE or st is State.RECORDING:
+                return
+            log.warning("watchdog: worker died in %s — forcing IDLE", st.value)
+            self.force_reset("Распознавание прервалось — запись в истории")
         t = threading.Timer(WATCHDOG_POLL_S, _check)
         t.daemon = True
         self._watchdog = t
         t.start()
 
-    def force_reset(self) -> None:
-        """Manual escape hatch: drop any half-finished state back to IDLE."""
+    def force_reset(self, message: Optional[str] = None) -> None:
+        """Manual escape hatch: drop any half-finished state back to IDLE and
+        close any capture stream still open."""
         with self._stop_lock:
+            self._gen += 1
             rec, self._recorder = self._recorder, None
         if rec is not None:
             try:
@@ -367,7 +382,10 @@ class GuiController:
                 self.state.fail()
             finally:
                 self.state.reset()
-        self._emit_idle()
+        if message:
+            self._emit_idle(message)
+        else:
+            self._emit_idle()
 
     def _finish_recording(self) -> None:
         with self._stop_lock:
@@ -404,10 +422,13 @@ class GuiController:
             self.overlay.hide()
             self._emit(f"Ошибка записи: {exc}")
             return
+        with self._stop_lock:
+            self._gen += 1
+            gen = self._gen
         worker = threading.Thread(target=self._process, args=(frames,), daemon=True)
         self._worker = worker
         worker.start()
-        self._arm_watchdog(worker)
+        self._arm_watchdog(worker, gen)
 
     def _process(self, frames: bytes) -> None:
         from .pipeline import VoicePipeline

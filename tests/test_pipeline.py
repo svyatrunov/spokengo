@@ -49,7 +49,8 @@ def make(tmp_path, provider, injector, notes):
 def test_full_success_path(tmp_path):
     notes = []; inj = FakeInjector(ok=True)
     st, storage, pipe = make(tmp_path, FakeProvider("распознано"), inj, notes)
-    rid = pipe.process(loud(), target=None)
+    rid, ok = pipe.process(loud(), target=None)
+    assert ok is True
     assert inj.injected == ["распознано"]
     assert storage.get(rid).status == STATUS_DONE
     assert st.state is State.IDLE
@@ -58,7 +59,7 @@ def test_full_success_path(tmp_path):
 def test_silent_recording_skipped(tmp_path):
     notes = []; inj = FakeInjector(); prov = FakeProvider()
     st, storage, pipe = make(tmp_path, prov, inj, notes)
-    assert pipe.process(b"\x00\x00" * 16000, target=None) is None
+    assert pipe.process(b"\x00\x00" * 16000, target=None) == (None, False)
     assert prov.calls == 0 and inj.injected == []
     assert st.state is State.IDLE
 
@@ -67,7 +68,8 @@ def test_transient_error_is_queued(tmp_path):
     notes = []; inj = FakeInjector()
     prov = FakeProvider(exc=NetworkError("нет сети"))
     st, storage, pipe = make(tmp_path, prov, inj, notes)
-    rid = pipe.process(loud(), target=None)
+    rid, ok = pipe.process(loud(), target=None)
+    assert ok is False
     assert storage.get(rid).status == STATUS_PENDING   # saved for manual retry
     assert inj.injected == []
     assert st.state is State.IDLE
@@ -78,7 +80,7 @@ def test_permanent_error_not_queued(tmp_path):
     notes = []; inj = FakeInjector()
     prov = FakeProvider(exc=BadRequestError("неизвестная модель"))
     st, storage, pipe = make(tmp_path, prov, inj, notes)
-    rid = pipe.process(loud(), target=None)
+    rid, ok = pipe.process(loud(), target=None)
     assert rid is None                                  # nothing to retry
     assert storage.pending() == []                      # NOT queued
     assert storage.recent(1)[0].status == STATUS_FAILED
@@ -89,8 +91,9 @@ def test_permanent_error_not_queued(tmp_path):
 def test_injection_failure_keeps_text(tmp_path):
     notes = []; inj = FakeInjector(ok=False)
     st, storage, pipe = make(tmp_path, FakeProvider("text"), inj, notes)
-    rid = pipe.process(loud(), target=None)
-    assert storage.get(rid).status == STATUS_DONE
+    rid, ok = pipe.process(loud(), target=None)
+    assert ok is False                                # injection failed…
+    assert storage.get(rid).status == STATUS_DONE     # …but the text is safe
     assert any(lvl == "warn" for lvl, _ in notes)
 
 
