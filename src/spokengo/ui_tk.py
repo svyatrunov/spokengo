@@ -106,10 +106,10 @@ class ControlPanel:
         self.root.minsize(430, 560)
         self.root.configure(bg=BG)
         try:
-            import os
-            ico = os.path.join(os.path.dirname(__file__), "assets", "spokengo.ico")
-            if os.path.exists(ico):
-                self.root.iconbitmap(default=ico)
+            from .resources import icon_path
+            ico = icon_path()
+            if ico.exists():
+                self.root.iconbitmap(default=str(ico))
         except Exception:
             pass
 

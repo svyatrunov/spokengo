@@ -8,6 +8,8 @@ $py = ".\.venv-build\Scripts\python.exe"
 & $py -m pip install -e ".[runtime]" pyinstaller
 & $py -m PyInstaller --noconfirm --onefile --noconsole `
     --name SpokenGo `
+    --icon src\spokengo\assets\spokengo.ico `
     --collect-submodules spokengo `
-    src\spokengo\__main__.py
+    --add-data "src\spokengo\assets\spokengo.ico;spokengo/assets" `
+    scripts\pyi_entry.py
 Write-Host "Built dist\SpokenGo.exe"

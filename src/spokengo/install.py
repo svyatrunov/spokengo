@@ -13,6 +13,9 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from .resources import (ensure_installed_copy, icon_path as _icon_asset,
+                        installed_exe_path, is_frozen)
+
 
 def _scripts_dir() -> Path:
     return Path(sys.executable).parent
@@ -23,7 +26,15 @@ def _find_gui_target() -> tuple[str, str]:
 
     Prefers the console-less spokengo-gui.exe entry point. Falls back to
     pythonw.exe -m spokengo gui so the shortcut works from a dev checkout too.
+
+    A frozen build is its own launcher, and nothing named python.exe sits beside
+    it — the checks below would walk off the end and hand back a path that does
+    not exist, producing a dead shortcut.
     """
+    if is_frozen():
+        installed = installed_exe_path()
+        return (str(installed) if installed.exists()
+                else str(Path(sys.executable).resolve())), ""
     scripts = _scripts_dir()
     exe = scripts / "spokengo-gui.exe"
     if exe.exists():
@@ -35,7 +46,7 @@ def _find_gui_target() -> tuple[str, str]:
 
 
 def _bundled_ico() -> Path:
-    return Path(__file__).parent / "assets" / "spokengo.ico"
+    return _icon_asset()
 
 
 def make_ico(src: str | Path, dst: str | Path) -> None:
@@ -166,6 +177,7 @@ def maybe_create_shortcut_once(config_dir: Optional[Path] = None) -> None:
         sentinel = config_dir / _SENTINEL
         if sentinel.exists():
             return
+        ensure_installed_copy()   # no-op unless this is a downloaded .exe
         create_shortcut(config_dir=config_dir)
         sentinel.parent.mkdir(parents=True, exist_ok=True)
         sentinel.touch()

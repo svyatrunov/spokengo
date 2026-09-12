@@ -35,23 +35,31 @@
 
 ## Install (Windows)
 
-You need [Python 3.10+](https://www.python.org/downloads/) — tick **Add to PATH** during install.
+### Option A — download and run (easiest)
+
+1. Download **SpokenGo.exe** from the [latest release](https://github.com/svyatrunov/spokengo/releases/latest).
+2. Double-click it. Windows shows *"Windows protected your PC"* — click **More info**, then **Run anyway**. The build is not code-signed, so that warning is expected.
+3. On first launch it copies itself somewhere permanent and puts a **SpokenGo** icon on your Desktop. You can delete the download afterwards.
+
+No Python, no terminal, no ZIP. Cloud mode only — the binary does not carry the
+offline local-Whisper model, so pick Option B if you need that.
+
+### Option B — install from source
+
+Needs [Python 3.10+](https://www.python.org/downloads/) — tick **Add python.exe to PATH** during setup.
 
 ```powershell
-git clone https://github.com/svyatrunov/SpokenGo.git
-cd SpokenGo
+git clone https://github.com/svyatrunov/spokengo.git
+cd spokengo
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 ```
 
-The installer:
-1. Creates an isolated `.venv`
-2. Installs SpokenGo and all runtime dependencies
-3. Asks for your Groq API key (optional — you can add it later)
-4. Puts a **SpokenGo shortcut** on your Desktop and in the Start Menu
+The installer creates an isolated `.venv`, installs SpokenGo and its dependencies,
+asks for your Groq API key (optional — you can add it later), and puts a shortcut
+on the Desktop and in the Start Menu.
 
-After that just double-click the icon — no terminal needed.
-
-> **Why no `.exe`?** Unsigned executables trigger SmartScreen / antivirus. Installing from source into a venv is safer and fully transparent.
+Choose this one if you want the offline local-Whisper mode, want to read the code
+you are running, or want to update with `git pull`.
 
 ---
 
