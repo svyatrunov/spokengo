@@ -77,8 +77,9 @@ The key is stored in Windows Credential Manager (service `SpokenGo`), never on d
 SpokenGo can transcribe entirely on your machine. No internet connection or API
 key is needed once set up, and nothing leaves your computer.
 
-Open **Settings → Распознавание → 🖥 Локально** and follow the two steps in the
-window:
+Groq is the main, fast path. Offline mode is the fallback for when there is no
+internet: open **Settings → Распознавание → Офлайн · запасной** and follow the
+two steps in the window:
 
 1. **Установить движок** — downloads the official
    [whisper.cpp](https://github.com/ggml-org/whisper.cpp) command-line build
@@ -91,11 +92,14 @@ window:
 
 | Model | Size | Speed | Accuracy | Notes |
 |---|---|---|---|---|
-| Tiny | 78 MB | ●●●●● | ●○○○○ | short English phrases |
-| Base | 148 MB | ●●●●○ | ●●○○○ | tolerable Russian |
-| Small | 488 MB | ●●●○○ | ●●●○○ | good balance on a weak laptop |
-| **Large v3 Turbo · q5** ★ | 574 MB | ●●●○○ | ●●●●● | near-Groq quality, recommended |
-| Large v3 Turbo | 1.6 GB | ●●○○○ | ●●●●● | best accuracy, needs a strong CPU |
+| Tiny | 78 MB | ●●●●● | ●○○○○ | instant, weak for Russian |
+| Base | 148 MB | ●●●●○ | ●●○○○ | fast, tolerable Russian |
+| **Small** ★ | 488 MB | ●●●○○ | ●●●○○ | recommended: best speed/accuracy on a CPU |
+
+Large models (`large-v3-turbo`, `large-v3-turbo-q5_0`) are no longer offered
+for download: on an ordinary CPU a short phrase takes over a minute. If one is
+already on disk, or you pick it with **Выбрать файл…**, it still works and is
+labelled «медленно». For large-model accuracy use Groq.
 
 Already have a model? SpokenGo also **finds models on its own**: its models
 folder, `~/whisper.cpp/models`, `Downloads`, every HuggingFace cache location

@@ -3,6 +3,36 @@
 All notable changes are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.12.0
+
+- **Redesigned control panel.** Warm graphite instead of indigo on navy, with
+  red kept for recording only. One type family in four sizes, a 4/8/12/16/24 px
+  spacing scale, flat sections split by hairlines instead of cards inside
+  cards, and all text at WCAG AA contrast. The old grey 8-9 pt hints were
+  3.4:1. Icons are drawn and antialiased with Pillow, replacing the emoji and
+  Unicode glyphs, which rendered inconsistently.
+- **Record and copy side by side.** The round record button moved from the
+  header into the status panel. Next to it is an icon-only «Копировать
+  последний текст» button with a tooltip. History rows copy, retry and keep
+  audio with icon buttons too, and the busy state shows a thin progress line.
+- **Groq is the main path, offline is the fallback**, and the UI now says so:
+  «Groq · основной» / «Офлайн · запасной», with a one-line explanation under
+  the switch.
+- **Local models: Small is recommended; large models are gone from the
+  download list.** On an ordinary CPU, large-v3-turbo (and its q5 build) take
+  over a minute per phrase, so dictation is unusable. Small gives roughly half
+  of Base's word error rate on Russian and still answers within seconds. Large
+  models already on disk, or picked through «Выбрать файл…», keep working and
+  are labelled «медленно». Auto-selection prefers a fast model over a bigger,
+  slow one. `spokengo local download` now defaults to `small`. Groq model
+  choice is unchanged.
+- **Fix: long recordings no longer time out uploading to Groq.** The request
+  timeout was a flat 15 s for the entire upload, so an ~18 MB WAV failed with
+  «The write operation timed out». It now scales with file size: 15 s plus
+  time at a pessimistic ~0.8 Mbit/s, capped at 5 min. Short clips still fail
+  fast.
+- `scripts/ui_shot.py`: `slow` scenario plus `SHOT_STATE=recording|transcribing|error`.
+
 ## 0.11.0
 
 - **Local mode that actually works from the .exe.** The frozen build could never

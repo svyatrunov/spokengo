@@ -1,15 +1,28 @@
-"""Tkinter control panel — dark theme, hand-styled widgets.
+"""Tkinter control panel: warm graphite, one signal colour, hand-styled widgets.
 
 Layout (top → bottom):
-  header   — wordmark + live record chip
-  hero     — big state card: what the app is doing, the hotkeys, current engine
+  header   — wordmark
+  status   — the one raised panel: what the app is doing, the engine in use,
+             copy-last and the round record button side by side, the hotkeys
   tabs     — Настройки | История
-  settings — one card per concern: Распознавание (Groq / Локально), Хоткей,
+  settings — flat sections split by hairlines: Распознавание (Groq is the
+             main, fast path; Офлайн is the fallback), Горячая клавиша,
              Запись и хранилище. Every control applies instantly; there is no
              "Apply" button anywhere.
   local    — the offline setup lives entirely in the window: install the
-             whisper.cpp engine, download a model with a progress bar, or point
-             at a file/folder. Nothing ever tells the user to open a terminal.
+             whisper.cpp engine, pick or download a model from one compact
+             dropdown, or point at a file/folder. Nothing ever tells the user
+             to open a terminal.
+
+Design system (kept deliberately small):
+  colour   — neutrals BG < SURF < SURF2 < SURF3 < SEL, text TXT > SUB > MUT;
+             REC is the only saturated hue; GREEN / AMBER only for state.
+  type     — one family (Segoe UI), four sizes: 16 / 13 / 10 / 9 pt;
+             Semibold only for the wordmark, the status title and headings.
+  space    — 4 / 8 / 12 / 16 / 24 px, 20 px window gutter.
+  shape    — status panel 12 px radius, icon-button hover 6 px, record button
+             round; form controls stay square like native Windows fields.
+  icons    — drawn line icons from ui_icons (no emoji / Unicode glyphs).
 
 All app logic lives in GuiController; this module only draws and dispatches.
 """
@@ -20,84 +33,125 @@ import threading
 import time
 from typing import Callable, List, Optional
 
+from . import ui_icons
 from .controller import GuiController
 from .hotkeys import clipboard_action, combo_from_state
 from .state import State
 from .transcribe import local_engine as eng
 
 # ---------------------------------------------------------------- palette
-BG = "#141826"; BAR = "#0f1320"; SURF = "#1b2133"; SURF2 = "#262e45"; SURF3 = "#303a55"
-BORDER = "#2a3249"; BORDER2 = "#39425e"
-TXT = "#eef1f7"; SUB = "#c4cadb"; MUT = "#8f98b3"; DIM = "#6b7390"
-ACC = "#6366f1"; ACC_H = "#787bf5"; ACC_SOFT = "#2b2f6b"
-REC = "#ef4444"; REC_H = "#f26d6d"
-GREEN = "#4ade80"; GREEN_SOFT = "#173a2a"
-AMBER = "#fbbf24"; AMBER_SOFT = "#3d3216"
-BLUE = "#60a5fa"
+# Warm graphite plus one signal colour. SpokenGo is a recorder, so the only
+# saturated hue is the red REC lamp; everything else stays neutral and the
+# state colours (ready / working / needs attention) read at a glance.
+# Contrast (WCAG): TXT ≥10.7:1 and SUB ≥6.3:1 on every surface; MUT ≥4.7:1 on
+# BG / SURF / SURF2 (never used on SURF3 and lighter); REC_T ≥5.4:1 on BG–SURF2.
+BG = "#161615"      # window
+SURF = "#1e1e1c"    # the one raised panel (status)
+SURF2 = "#282826"   # controls: fields, segmented track, secondary buttons
+SURF3 = "#312f2c"   # hover
+SEL = "#3d3b37"     # selected segment / pressed
+LINE = "#2a2a27"    # hairline separators
+LINE2 = "#3d3c38"   # control outline, popup border
+TXT = "#eeede9"; SUB = "#b9b7b0"; MUT = "#95928a"
+PRIMARY = TXT; PRIMARY_H = "#ffffff"; ON_PRIMARY = BG      # primary button
+REC = "#e5484d"; REC_H = "#ec5f63"; REC_T = "#f2777a"    # fill / hover / text
+GREEN = "#5fc48d"
+AMBER = "#e8b04e"
+
+# ---------------------------------------------------------------- type & space
 FONT = "Segoe UI"
+FONT_SEMI = "Segoe UI Semibold"      # a separate family on Windows
+DISPLAY, TITLE, BODY, SMALL = 16, 13, 10, 9
+S1, S2, S3, S4, S5 = 4, 8, 12, 16, 24
+PAD = 20
+
+_semibold_ok = False
 
 _STATE = {
-    State.IDLE:         (GREEN, "Запись",    "Готов к диктовке"),
-    State.RECORDING:    (REC,   "Стоп",      "Слушаю…"),
-    State.TRANSCRIBING: (AMBER, "Распознаю", "Распознаю речь…"),
-    State.INJECTING:    (BLUE,  "Вставка",   "Вставляю текст…"),
-    State.ERROR:        (REC,   "Ошибка",    "Что-то пошло не так"),
+    # state:           (lamp,  title)
+    State.IDLE:         (REC,   "Готов к диктовке"),
+    State.RECORDING:    (REC,   "Слушаю…"),
+    State.TRANSCRIBING: (AMBER, "Распознаю речь…"),
+    State.INJECTING:    (GREEN, "Вставляю текст…"),
+    State.ERROR:        (REC,   "Что-то пошло не так"),
 }
 
 
+def _f(size=BODY, bold=False, underline=False):
+    if bold and _semibold_ok:
+        return (FONT_SEMI, size) + (("underline",) if underline else ())
+    style = " ".join(s for s in ("bold" if bold else "", "underline" if underline else "") if s)
+    return (FONT, size, style or "normal")
+
+
+def _init_fonts(root) -> None:
+    global _semibold_ok
+    try:
+        import tkinter.font as tkfont
+        _semibold_ok = FONT_SEMI in set(tkfont.families(root))
+    except Exception:
+        _semibold_ok = False
+
+
+def _photo(tk_mod, b64: str):
+    return tk_mod.PhotoImage(data=b64)
+
+
 def _smooth_rect(canvas, x0, y0, x1, y1, r, **kw):
-    """Rounded polygon — B-spline smoothing gives soft corners."""
+    """Rounded polygon (fallback when Pillow is unavailable)."""
     pts = (x0+r, y0,  x1-r, y0,  x1, y0,  x1, y0+r,
            x1, y1-r,  x1, y1,  x1-r, y1,  x0+r, y1,
            x0, y1,  x0, y1-r,  x0, y0+r,  x0, y0)
     return canvas.create_polygon(pts, smooth=True, **kw)
 
 
-def _f(size=10, bold=False):
-    return (FONT, size, "bold" if bold else "normal")
-
-
 class _RCard:
-    """Canvas-backed card with rounded corners. ``.inner`` is the content frame."""
-    def __init__(self, tk_mod, parent, *, bg=SURF, border=BORDER, radius=12, outer=BG):
+    """Rounded, borderless panel. ``.inner`` is the content frame.
+
+    The rounded background is an antialiased image (ui_icons), redrawn when
+    the panel is resized, so the corners stay smooth on Windows too.
+    """
+    def __init__(self, tk_mod, parent, *, bg=SURF, radius=12, outer=BG):
+        self.tk = tk_mod
         self._cv = tk_mod.Canvas(parent, bg=outer, highlightthickness=0, bd=0)
         self.inner = tk_mod.Frame(self._cv, bg=bg)
-        self._bg, self._bdr, self._r = bg, border, radius
-        self._win = self._cv.create_window(1, 1, window=self.inner, anchor="nw")
+        self._bg, self._outer, self._r = bg, outer, radius
+        self._img = None
+        self._size = (0, 0)
+        self._win = self._cv.create_window(0, 0, window=self.inner, anchor="nw")
         self._cv.bind("<Configure>", lambda e: self._cv.after_idle(self._draw))
         self.inner.bind("<Configure>", lambda e: self._cv.after_idle(self._draw))
-
-    def recolor(self, bg=None, border=None):
-        if bg: self._bg = bg; self.inner.configure(bg=bg)
-        if border: self._bdr = border
-        self._draw()
 
     def _draw(self):
         try:
             w = self._cv.winfo_width()
             if w <= 1:
                 return
-            h = self.inner.winfo_reqheight() + 2
-            self._cv.configure(height=max(h, 24))
-            self._cv.itemconfigure(self._win, width=max(w - 2, 1))
+            h = max(self.inner.winfo_reqheight(), 24)
+            self._cv.configure(height=h)
+            self._cv.itemconfigure(self._win, width=w)
+            if self._size == (w, h):
+                return
+            self._size = (w, h)
             self._cv.delete("r")
-            _smooth_rect(self._cv, 1, 1, w - 1, h - 1, self._r,
-                         fill=self._bg, outline=self._bdr, tags="r")
+            if ui_icons.available():
+                self._img = _photo(self.tk, ui_icons.rounded_panel_png(
+                    w, h, self._r, self._bg, self._outer))
+                self._cv.create_image(0, 0, image=self._img, anchor="nw", tags="r")
+            else:
+                _smooth_rect(self._cv, 0, 0, w, h, self._r, fill=self._bg, outline="", tags="r")
             self._cv.tag_lower("r")
         except Exception:
             pass
 
     def pack(self, **kw): self._cv.pack(**kw)
-    def pack_forget(self): self._cv.pack_forget()
-    def grid(self, **kw): self._cv.grid(**kw)
 
 
 class _Progress:
-    """Thin rounded progress bar on a canvas (determinate + indeterminate)."""
-    def __init__(self, tk_mod, parent, height=6, bg=SURF):
-        self.tk = tk_mod
+    """Thin progress line on a canvas (determinate + indeterminate sweep)."""
+    def __init__(self, tk_mod, parent, height=4, bg=BG, track=SURF2, fill=SUB):
         self.cv = tk_mod.Canvas(parent, height=height, bg=bg, highlightthickness=0, bd=0)
-        self._h = height
+        self._h, self._track, self._fill = height, track, fill
         self._frac = 0.0
         self._pulse = None
         self.cv.bind("<Configure>", lambda e: self._draw())
@@ -112,15 +166,18 @@ class _Progress:
         if w <= 2:
             return
         cv.delete("all")
-        _smooth_rect(cv, 0, 0, w, h, h // 2, fill=SURF3, outline="")
+        if self._track:
+            cv.create_rectangle(0, 0, w, h, fill=self._track, outline="")
         if offset >= 0:                      # indeterminate sweep
             seg = w * 0.3
             x0 = -seg + (w + seg) * offset
-            _smooth_rect(cv, max(0, x0), 0, min(w, x0 + seg), h, h // 2, fill=ACC, outline="")
+            cv.create_rectangle(max(0, x0), 0, min(w, x0 + seg), h, fill=self._fill, outline="")
         elif self._frac > 0:
-            _smooth_rect(cv, 0, 0, max(h, w * self._frac), h, h // 2, fill=ACC, outline="")
+            cv.create_rectangle(0, 0, max(h, w * self._frac), h, fill=self._fill, outline="")
 
-    def pulse(self, on: bool):
+    def pulse(self, on: bool, fill: Optional[str] = None):
+        if fill:
+            self._fill = fill
         if on and self._pulse is None:
             t0 = time.monotonic()
 
@@ -137,6 +194,57 @@ class _Progress:
             self._draw()
 
     def pack(self, **kw): self.cv.pack(**kw)
+
+
+class _Tooltip:
+    """Small delayed hint next to a widget (for icon-only buttons)."""
+    DELAY_MS = 450
+
+    def __init__(self, tk_mod, widget, text: str):
+        self.tk, self.w, self.text = tk_mod, widget, text
+        self._tip = None
+        self._after = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        self._after = self.w.after(self.DELAY_MS, self._show)
+
+    def _cancel(self):
+        if self._after:
+            try: self.w.after_cancel(self._after)
+            except Exception: pass
+            self._after = None
+
+    def _show(self):
+        if self._tip or not self.text:
+            return
+        try:
+            x = self.w.winfo_rootx()
+            y = self.w.winfo_rooty() + self.w.winfo_height() + S1
+            tip = self.tk.Toplevel(self.w)
+            tip.overrideredirect(True)
+            tip.configure(bg=LINE2)
+            self.tk.Label(tip, text=self.text, bg=SURF2, fg=TXT, font=_f(SMALL),
+                          padx=S2, pady=S1, justify="left").pack(padx=1, pady=1)
+            tip.update_idletasks()
+            # keep it on screen: right-align to the widget if it would overflow
+            sw = tip.winfo_screenwidth()
+            if x + tip.winfo_reqwidth() > sw - 8:
+                x = self.w.winfo_rootx() + self.w.winfo_width() - tip.winfo_reqwidth()
+            tip.geometry(f"+{x}+{y}")
+            self._tip = tip
+        except Exception:
+            self._tip = None
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip is not None:
+            try: self._tip.destroy()
+            except Exception: pass
+            self._tip = None
 
 
 class ControlPanel:
@@ -158,6 +266,10 @@ class ControlPanel:
         self._dl_cancel: Optional[threading.Event] = None
         self._dl_running = False
         self._status_after = None
+        self._status_msg: Optional[tuple] = None       # (text, error) while shown
+        self._icons_ok = ui_icons.available()
+        self._wrap_settings: list = []                  # (label, margin) re-wrapped on resize
+        self._wrap_history: list = []
 
         try:  # Windows taskbar: our own icon, not Python's
             import ctypes
@@ -166,9 +278,10 @@ class ControlPanel:
             pass
 
         self.root = tk.Tk()
+        _init_fonts(self.root)
         self.root.title("SpokenGo")
-        self.root.geometry("500x680")
-        self.root.minsize(470, 600)
+        self.root.geometry("500x690")
+        self.root.minsize(460, 600)
         self.root.configure(bg=BG)
         try:
             from .resources import icon_path
@@ -184,7 +297,7 @@ class ControlPanel:
         self.ctrl.overlay = ov
 
         self._build_header()
-        self._build_hero()
+        self._build_status()
         self._build_tabs()
         self._build_settings()
         self._build_history()
@@ -200,59 +313,105 @@ class ControlPanel:
         self.root.after(100, self._drain_ui_queue)
 
     # ================================================================ helpers
-    def _card(self, parent, **kw):
-        return _RCard(self.tk, parent, **kw)
-
-    def _label(self, parent, text, color=TXT, size=10, bold=False, bg=BG, **kw):
+    def _label(self, parent, text, color=TXT, size=BODY, bold=False, bg=BG, **kw):
         return self.tk.Label(parent, text=text, bg=bg, fg=color, font=_f(size, bold), **kw)
 
-    def _btn(self, parent, text, cmd, primary=False, danger=False, small=False, bg=None):
-        base = ACC if primary else (bg or SURF2)
-        hover = ACC_H if primary else SURF3
-        fg = "#ffffff" if primary else (REC_H if danger else TXT)
+    def _btn(self, parent, text, cmd, primary=False, bg=BG, small=False):
+        """Text button. Primary = light fill (one per view); secondary = field grey."""
         b = self.tk.Button(parent, text=text, command=cmd, relief="flat", bd=0,
-                           cursor="hand2", padx=(10 if small else 14), pady=(4 if small else 7),
-                           bg=base, fg=fg, activebackground=hover, activeforeground=fg,
-                           font=_f(9 if small else 10), highlightthickness=0)
-        b.bind("<Enter>", lambda e: b.configure(bg=hover))
-        b.bind("<Leave>", lambda e: b.configure(bg=base))
+                           cursor="hand2", padx=(S3 if small else S4), pady=(3 if small else 5),
+                           font=_f(SMALL if small else BODY), highlightthickness=1,
+                           highlightbackground=bg, highlightcolor=SUB, takefocus=1)
+        (self._style_primary if primary else self._style_secondary)(b)
         return b
 
-    def _entry(self, parent, textvariable, show=None, width=None, center=False):
-        e = self.tk.Entry(parent, textvariable=textvariable, show=show, width=width,
-                          bg=BAR, fg=TXT, insertbackground=TXT, relief="flat",
-                          highlightthickness=1, highlightbackground=BORDER2,
-                          highlightcolor=ACC, font=_f(11),
-                          justify="center" if center else "left")
-        return e
+    def _style_primary(self, b):
+        b.configure(bg=PRIMARY, fg=ON_PRIMARY, activebackground=PRIMARY_H,
+                    activeforeground=ON_PRIMARY)
+        b.bind("<Enter>", lambda e: b.configure(bg=PRIMARY_H))
+        b.bind("<Leave>", lambda e: b.configure(bg=PRIMARY))
 
-    def _segment(self, parent, items, on_pick, bg=SURF):
-        """Segmented control: list of (label, id). Returns dict id → label widget."""
-        seg = self.tk.Frame(parent, bg=BORDER2)
+    def _style_secondary(self, b):
+        b.configure(bg=SURF2, fg=TXT, activebackground=SEL, activeforeground=TXT)
+        b.bind("<Enter>", lambda e: b.configure(bg=SURF3))
+        b.bind("<Leave>", lambda e: b.configure(bg=SURF2))
+
+    def _icon_btn(self, parent, name, cmd, tip, bg=BG, color=MUT, hover_color=TXT,
+                  hover_fill=None, fallback="•", box=28, rest_fill=None, radius=6):
+        """Icon-only button (16 px glyph in a ``box`` px target) with a tooltip.
+        ``rest_fill`` gives it a visible resting shape (e.g. round, next to REC)."""
+        tk = self.tk
+        hover_fill = hover_fill or (SURF3 if bg == SURF else SURF2)
+        if self._icons_ok:
+            img = _photo(tk, ui_icons.icon_png(name, color, box=box, fill=rest_fill,
+                                               radius=radius))
+            img_h = _photo(tk, ui_icons.icon_png(name, hover_color, box=box, fill=hover_fill,
+                                                 radius=radius))
+            b = tk.Button(parent, image=img, command=cmd, relief="flat", bd=0,
+                          bg=bg, activebackground=bg, cursor="hand2",
+                          highlightthickness=1, highlightbackground=bg, highlightcolor=SUB,
+                          width=box, height=box, takefocus=1)
+            b._imgs = (img, img_h)
+            b.bind("<Enter>", lambda e: b.configure(image=img_h), add="+")
+            b.bind("<Leave>", lambda e: b.configure(image=img), add="+")
+        else:
+            b = tk.Button(parent, text=fallback, command=cmd, relief="flat", bd=0,
+                          bg=bg, fg=color, activebackground=hover_fill, activeforeground=hover_color,
+                          font=_f(BODY), cursor="hand2", padx=S2, highlightthickness=0)
+        _Tooltip(tk, b, tip)
+        return b
+
+    def _link(self, parent, text, cmd, bg=BG, size=SMALL):
+        lk = self.tk.Label(parent, text=text, bg=bg, fg=SUB, font=_f(size, underline=True),
+                           cursor="hand2")
+        lk.bind("<Button-1>", lambda e: cmd())
+        lk.bind("<Enter>", lambda e: lk.configure(fg=TXT))
+        lk.bind("<Leave>", lambda e: lk.configure(fg=SUB))
+        return lk
+
+    def _entry(self, parent, textvariable, show=None, width=None, center=False):
+        return self.tk.Entry(parent, textvariable=textvariable, show=show, width=width,
+                             bg=SURF2, fg=TXT, insertbackground=TXT, relief="flat",
+                             highlightthickness=1, highlightbackground=LINE2,
+                             highlightcolor=SUB, font=_f(BODY),
+                             selectbackground=SEL, selectforeground=TXT,
+                             justify="center" if center else "left")
+
+    def _segment(self, parent, items, on_pick):
+        """Segmented control on a field-grey track; the pick is a lighter tile."""
+        tk = self.tk
+        seg = tk.Frame(parent, bg=SURF2, padx=3, pady=3)
         seg.pack(fill="x")
         out = {}
         for i, (label, sid) in enumerate(items):
-            b = self.tk.Label(seg, text=label, bg=SURF2, fg=MUT, font=_f(10),
-                              cursor="hand2", pady=8)
-            b.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 1, 0))
-            seg.grid_columnconfigure(i, weight=1)
+            b = tk.Label(seg, text=label, bg=SURF2, fg=MUT, font=_f(BODY),
+                         cursor="hand2", pady=5)
+            b.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 3, 0))
+            seg.grid_columnconfigure(i, weight=1, uniform="seg")
             b.bind("<Button-1>", lambda e, s=sid: on_pick(s))
+            b.bind("<Enter>", lambda e, w=b: w._on or w.configure(bg=SURF3, fg=SUB))
+            b.bind("<Leave>", lambda e, w=b: w._on or w.configure(bg=SURF2, fg=MUT))
+            b._on = False
             out[sid] = b
         return out
 
     @staticmethod
     def _paint_segment(seg: dict, current: str):
         for sid, b in seg.items():
-            on = sid == current
-            b.configure(bg=ACC if on else SURF2, fg="#ffffff" if on else MUT)
+            b._on = sid == current
+            b.configure(bg=SEL if b._on else SURF2, fg=TXT if b._on else MUT)
 
-    def _pill(self, parent, text, fg, soft, bg=SURF):
-        """Small rounded status badge: ● text."""
-        f = self.tk.Frame(parent, bg=soft, padx=9, pady=2)
-        lbl = self.tk.Label(f, text=text, bg=soft, fg=fg, font=_f(9))
-        lbl.pack()
-        f._lbl = lbl
-        return f
+    def _wrap(self, label, margin=0, history=False):
+        (self._wrap_history if history else self._wrap_settings).append((label, margin))
+        return label
+
+    @staticmethod
+    def _rewrap(items, width):
+        for lbl, margin in list(items):
+            try:
+                lbl.configure(wraplength=max(120, width - margin))
+            except Exception:
+                items.remove((lbl, margin))
 
     def _post(self, fn: Callable[[], None]):
         """Run ``fn`` on the Tk thread (from worker threads)."""
@@ -274,69 +433,77 @@ class ControlPanel:
     def _build_header(self):
         tk = self.tk
         bar = tk.Frame(self.root, bg=BG)
-        bar.pack(fill="x", padx=22, pady=(18, 2))
-        left = tk.Frame(bar, bg=BG); left.pack(side="left")
-        self._label(left, "SpokenGo", size=19, bold=True).pack(side="left")
+        bar.pack(fill="x", padx=PAD, pady=(S4 + 2, 0))
+        self._label(bar, "SpokenGo", size=DISPLAY, bold=True).pack(side="left")
         from . import __version__
-        self._label(left, f"v{__version__}", color=DIM, size=8).pack(side="left", padx=(8, 0), pady=(8, 0))
+        self._label(bar, f"v{__version__}", color=MUT, size=SMALL).pack(
+            side="left", padx=(S2, 0), pady=(S1 + 2, 0))
 
-        CHIP_H, CHIP_W = 36, 136
-        self._chip_cv = tk.Canvas(bar, width=CHIP_W, height=CHIP_H, bg=BG,
-                                  highlightthickness=0, bd=0, cursor="hand2")
-        self._chip_cv.pack(side="right")
-        self._chip_pill = _smooth_rect(self._chip_cv, 0, 1, CHIP_W, CHIP_H - 1, CHIP_H // 2,
-                                       fill=ACC, outline="")
-        self._chip_oval = self._chip_cv.create_oval(0, 0, 1, 1, fill=GREEN, outline="")
-        self._chip_sq = self._chip_cv.create_rectangle(0, 0, 1, 1, fill="#ffffff",
-                                                       outline="", state="hidden")
-        self._chip_txt = self._chip_cv.create_text(77, CHIP_H // 2, text="Запись",
-                                                   fill="#ffffff", anchor="center", font=_f(11))
-        self._chip_cv.bind("<Button-1>", lambda e: self.ctrl.toggle())
-        self._chip_layout("Запись")
-
-    def _chip_layout(self, label: str) -> None:
-        try:
-            import tkinter.font as tkfont
-            tw = tkfont.Font(family=FONT, size=11).measure(label)
-        except Exception:
-            tw = max(1, len(label) * 7)
-        DOT_R, GAP, CHIP_W, CHIP_H = 5, 8, 136, 36
-        x0 = (CHIP_W - DOT_R * 2 - GAP - tw) / 2
-        dx, dy = x0 + DOT_R, CHIP_H // 2
-        self._chip_cv.coords(self._chip_oval, dx - DOT_R, dy - DOT_R, dx + DOT_R, dy + DOT_R)
-        self._chip_cv.coords(self._chip_sq, dx - 4, dy - 4, dx + 4, dy + 4)
-        self._chip_cv.coords(self._chip_txt, x0 + DOT_R * 2 + GAP + tw / 2, dy)
-
-    # ================================================================ hero
-    def _build_hero(self):
+    # ================================================================ status panel
+    def _build_status(self):
         tk = self.tk
-        self._hero = self._card(self.root, bg=SURF, border=BORDER, radius=14)
-        self._hero.pack(fill="x", padx=22, pady=(12, 0))
-        h = tk.Frame(self._hero.inner, bg=SURF); h.pack(fill="x", padx=16, pady=14)
+        self._hero = _RCard(tk, self.root, bg=SURF, radius=12)
+        self._hero.pack(fill="x", padx=PAD, pady=(S3, 0))
+        h = tk.Frame(self._hero.inner, bg=SURF)
+        h.pack(fill="x", padx=S4, pady=(S4, 0))
 
         top = tk.Frame(h, bg=SURF); top.pack(fill="x")
-        self._hero_dot = tk.Canvas(top, width=14, height=14, bg=SURF, highlightthickness=0)
-        self._hero_dot.pack(side="left", pady=(3, 0))
-        self._hero_dot_id = self._hero_dot.create_oval(2, 2, 12, 12, fill=GREEN, outline="")
-        self._hero_title = self._label(top, "Готов к диктовке", size=13, bold=True, bg=SURF)
-        self._hero_title.pack(side="left", padx=(8, 0))
-        self._hero_mode = self._pill(top, "", ACC_H, ACC_SOFT)
-        self._hero_mode.pack(side="right")
+        actions = tk.Frame(top, bg=SURF); actions.pack(side="right")
+        self._copy_btn = self._icon_btn(actions, "copy", self._copy_last,
+                                        "Копировать последний текст", bg=SURF, color=SUB,
+                                        rest_fill=SURF2, hover_fill=SURF3, box=36, radius=18,
+                                        fallback="Копировать")
+        self._copy_btn.pack(side="left", padx=(0, S2))
+        self._rec_imgs = {}
+        self._rec_btn = tk.Button(actions, command=lambda: self.ctrl.toggle(), relief="flat", bd=0,
+                                  bg=SURF, activebackground=SURF, cursor="hand2",
+                                  highlightthickness=1, highlightbackground=SURF,
+                                  highlightcolor=SUB, takefocus=1)
+        if not self._icons_ok:
+            self._rec_btn.configure(text="Запись", fg=TXT, font=_f(BODY), padx=S3, pady=S1,
+                                    bg=SURF2, activebackground=SURF3)
+        self._rec_btn.pack(side="left")
+        self._rec_tip = _Tooltip(tk, self._rec_btn, "")
+        self._rec_btn.bind("<Enter>", lambda e: self._paint_rec(hover=True), add="+")
+        self._rec_btn.bind("<Leave>", lambda e: self._paint_rec(hover=False), add="+")
+        self._rec_state = State.IDLE
 
-        self._hero_keys = tk.Frame(h, bg=SURF); self._hero_keys.pack(fill="x", pady=(10, 0))
+        text = tk.Frame(top, bg=SURF); text.pack(side="left", fill="x", expand=True)
+        self._hero_title = self._label(text, "Готов к диктовке", size=TITLE, bold=True, bg=SURF)
+        self._hero_title.pack(anchor="w")
+        self.status_lbl = self._label(text, "", color=MUT, size=SMALL, bg=SURF,
+                                      anchor="w", justify="left", wraplength=300)
+        self.status_lbl.pack(anchor="w", fill="x", pady=(2, 0))
+        text.bind("<Configure>", lambda e: self.status_lbl.configure(
+            wraplength=max(160, e.width - S2)))
+
+        self._hero_keys = tk.Frame(h, bg=SURF); self._hero_keys.pack(fill="x", pady=(S3, 0))
         self._key_caps = {}
         for name in ("start", "stop", "cancel"):
-            cap = tk.Label(self._hero_keys, text="", bg=BAR, fg=SUB, font=(FONT, 9),
-                           padx=7, pady=2, highlightthickness=1, highlightbackground=BORDER2)
-            hint = tk.Label(self._hero_keys, text="", bg=SURF, fg=MUT, font=_f(9))
+            cap = tk.Label(self._hero_keys, text="", bg=SURF2, fg=SUB, font=_f(SMALL),
+                           padx=6, pady=1)
+            hint = tk.Label(self._hero_keys, text="", bg=SURF, fg=MUT, font=_f(SMALL))
             self._key_caps[name] = (cap, hint)
         self._layout_keycaps()
+        # Busy line at the panel's bottom edge; invisible (panel-coloured) when idle.
+        self._hero_bar = _Progress(tk, h, height=2, bg=SURF, track=SURF, fill=AMBER)
+        self._hero_bar.pack(fill="x", pady=(S3, S2))
 
-        bottom = tk.Frame(h, bg=SURF); bottom.pack(fill="x", pady=(10, 0))
-        self.status_lbl = tk.Label(bottom, text="", bg=SURF, fg=MUT, font=_f(9),
-                                   anchor="w", justify="left", wraplength=300)
-        self.status_lbl.pack(side="left", fill="x", expand=True)
-        self._btn(bottom, "⧉ Последний текст", self._copy_last, small=True).pack(side="right")
+    def _paint_rec(self, hover: bool = False) -> None:
+        if not self._icons_ok:
+            return
+        st = self._rec_state
+        if st is State.RECORDING:
+            key = ("stop", REC_H if hover else REC, "#ffffff")
+            b64 = ui_icons.record_png("stop", fill=key[1], dot=key[2])
+        else:
+            lamp = _STATE.get(st, _STATE[State.IDLE])[0]
+            key = ("dot", SEL if hover else SURF3, lamp)
+            b64 = ui_icons.record_png("dot", ring=key[1], dot=key[2])
+        img = self._rec_imgs.get(key)
+        if img is None:
+            img = self._rec_imgs[key] = _photo(self.tk, b64)
+        self._rec_btn.configure(image=img)
 
     def _layout_keycaps(self):
         cfg = self.ctrl.cfg
@@ -348,8 +515,8 @@ class ControlPanel:
             cap, hint = self._key_caps[name]
             cap.configure(text=self._pretty_key(key))
             hint.configure(text=what)
-            cap.pack(side="left", padx=((0 if i == 0 else 14), 0))
-            hint.pack(side="left", padx=(5, 0))
+            cap.pack(side="left", padx=((0 if i == 0 else S4), 0))
+            hint.pack(side="left", padx=(6, 0))
 
     @staticmethod
     def _pretty_key(k: str) -> str:
@@ -358,43 +525,50 @@ class ControlPanel:
         return " + ".join(names.get(p, p.upper() if len(p) == 1 else p.capitalize())
                           for p in k.split("+"))
 
-    def _refresh_hero(self):
+    def _mode_text(self):
+        """(text, colour) naming the engine that will handle the next dictation."""
         cfg = self.ctrl.cfg
         if cfg.provider == "groq":
-            model = "Turbo" if "turbo" in cfg.model else "Large v3"
-            txt, fg, soft = f"☁  Groq · {model}", ACC_H, ACC_SOFT
             if not self.ctrl.has_key():
-                txt, fg, soft = "☁  Groq · нет ключа", AMBER, AMBER_SOFT
-        else:
-            st = self.ctrl.local_status()
-            if st.ready:
-                name = st.selected.name.replace("Large v3 ", "").replace(" · ", " ")
-                if len(name) > 16:
-                    name = name[:15] + "…"
-                txt, fg, soft = f"🖥  Локально · {name}", GREEN, GREEN_SOFT
-            else:
-                txt, fg, soft = "🖥  Локально · не настроено", AMBER, AMBER_SOFT
-        self._hero_mode.configure(bg=soft)
-        self._hero_mode._lbl.configure(text=txt, bg=soft, fg=fg)
+                return "Groq · нужен ключ API", AMBER
+            return f"Groq · {'Turbo' if 'turbo' in cfg.model else 'Large v3'}", MUT
+        st = getattr(self, "_local_st", None) or self.ctrl.local_status()
+        if not st.ready:
+            return "Офлайн · не настроен", AMBER
+        name = st.selected.name
+        if len(name) > 22:
+            name = name[:21] + "…"
+        if st.selected.slow:
+            return f"Офлайн · {name} · медленно", AMBER
+        return f"Офлайн · {name}", MUT
+
+    def _refresh_hero(self):
+        if self._status_msg is None:
+            txt, fg = self._mode_text()
+            self.status_lbl.configure(text=txt, fg=fg)
         self._layout_keycaps()
 
     # ================================================================ tabs
     def _build_tabs(self):
-        bar = self.tk.Frame(self.root, bg=BG)
-        bar.pack(fill="x", padx=22, pady=(16, 0))
+        tk = self.tk
+        bar = tk.Frame(self.root, bg=BG)
+        bar.pack(fill="x", padx=PAD, pady=(S5, 0))
         self._tabs = {}
         for key, title in (("settings", "Настройки"), ("history", "История")):
-            holder = self.tk.Frame(bar, bg=BG)
-            holder.pack(side="left", padx=(0, 22))
-            lbl = self._label(holder, title, color=MUT, size=11, cursor="hand2")
+            holder = tk.Frame(bar, bg=BG)
+            holder.pack(side="left", padx=(0, S5))
+            lbl = self._label(holder, title, color=MUT, size=BODY, cursor="hand2")
             lbl.pack()
-            ind = self.tk.Frame(holder, bg=BG, height=2)
-            ind.pack(fill="x", pady=(6, 0))
+            ind = tk.Frame(holder, bg=BG, height=2)
+            ind.pack(fill="x", pady=(S2, 0))
             lbl.bind("<Button-1>", lambda e, k=key: self._show_tab(k))
+            lbl.bind("<Enter>", lambda e, k=key, w=lbl: self._tab_now != k and w.configure(fg=SUB))
+            lbl.bind("<Leave>", lambda e, k=key, w=lbl: self._tab_now != k and w.configure(fg=MUT))
             self._tabs[key] = (lbl, ind)
-        self.tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x", padx=22)
-        self._body = self.tk.Frame(self.root, bg=BG)
-        self._body.pack(fill="both", expand=True, padx=22, pady=(12, 14))
+        self._tab_now = None
+        tk.Frame(self.root, bg=LINE, height=1).pack(fill="x", padx=PAD)
+        self._body = tk.Frame(self.root, bg=BG)
+        self._body.pack(fill="both", expand=True, padx=(PAD, PAD - S2), pady=(S1, S3))
         self._active_scroll = None
         self.root.bind_all("<MouseWheel>", self._on_scroll)
         self.root.bind_all("<Button-4>", lambda e: self._scroll_by(-1))
@@ -408,10 +582,11 @@ class ControlPanel:
             self._active_scroll.yview_scroll(units, "units")
 
     def _show_tab(self, key):
+        self._tab_now = key
         for k, (lbl, ind) in self._tabs.items():
             active = k == key
             lbl.configure(fg=TXT if active else MUT)
-            ind.configure(bg=ACC if active else BG)
+            ind.configure(bg=TXT if active else BG)
         for w in (getattr(self, "_settings", None), getattr(self, "_history", None)):
             if w is not None:
                 w.pack_forget()
@@ -423,8 +598,8 @@ class ControlPanel:
             self._active_scroll = getattr(self, "_hist_canvas", None)
             self._refresh_history()
 
-    def _scrollable(self, parent):
-        """Canvas + dark scrollbar; returns (canvas, inner_frame)."""
+    def _scrollable(self, parent, on_width=None):
+        """Canvas + thin auto-hiding scrollbar; returns (canvas, inner_frame)."""
         import tkinter.ttk as ttk
         tk = self.tk
         st = ttk.Style()
@@ -432,93 +607,107 @@ class ControlPanel:
             st.theme_use("clam")
         except Exception:
             pass
-        st.configure("Dark.Vertical.TScrollbar", background=SURF2, troughcolor=BG,
-                     bordercolor=BG, lightcolor=SURF2, darkcolor=SURF2, arrowcolor=BG,
-                     gripcount=0, relief="flat", width=6)
-        st.map("Dark.Vertical.TScrollbar", background=[("active", BORDER2), ("pressed", ACC)])
+        st.configure("Thin.Vertical.TScrollbar", background=SURF3, troughcolor=BG,
+                     bordercolor=BG, lightcolor=SURF3, darkcolor=SURF3, arrowcolor=BG,
+                     gripcount=0, relief="flat", width=6, arrowsize=6)
+        st.map("Thin.Vertical.TScrollbar", background=[("active", LINE2), ("pressed", MUT)])
         try:
-            st.layout("Dark.Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+            st.layout("Thin.Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
                 ("Vertical.Scrollbar.thumb", {"expand": 1, "sticky": "nswe"})]})])
         except Exception:
             pass
         wrap = tk.Frame(parent, bg=BG); wrap.pack(fill="both", expand=True)
         cv = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
         sb = ttk.Scrollbar(wrap, orient="vertical", command=cv.yview,
-                           style="Dark.Vertical.TScrollbar")
-        cv.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y", padx=(6, 0))
+                           style="Thin.Vertical.TScrollbar")
+
+        def _sb_set(first, last):
+            sb.set(first, last)
+            need = not (float(first) <= 0.0 and float(last) >= 1.0)
+            if need and not sb.winfo_ismapped():
+                sb.pack(side="right", fill="y", padx=(S1, 0), before=cv)
+            elif not need and sb.winfo_ismapped():
+                sb.pack_forget()
+        cv.configure(yscrollcommand=_sb_set)
         cv.pack(side="left", fill="both", expand=True)
         inner = tk.Frame(cv, bg=BG)
         win = cv.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
-        cv.bind("<Configure>", lambda e: cv.itemconfig(win, width=e.width))
+
+        def _cv_conf(e):
+            cv.itemconfig(win, width=e.width - S2)          # breathing room before the bar
+            if on_width:
+                on_width(e.width - S2)
+        cv.bind("<Configure>", _cv_conf)
         return cv, inner
 
     # ================================================================ settings
-    def _section(self, parent, title, subtitle=None):
-        card = self._card(parent)
-        body = self.tk.Frame(card.inner, bg=SURF)
-        body.pack(fill="x", padx=14, pady=(12, 13))
-        head = self.tk.Frame(body, bg=SURF); head.pack(fill="x")
-        self._label(head, title, color=TXT, size=10, bold=True, bg=SURF).pack(side="left")
-        if subtitle:
-            self._label(head, subtitle, color=DIM, size=9, bg=SURF).pack(side="left", padx=(8, 0))
-        return card, body, head
+    def _section(self, parent, title, first=False):
+        tk = self.tk
+        wrap = tk.Frame(parent, bg=BG); wrap.pack(fill="x")
+        if not first:
+            tk.Frame(wrap, bg=LINE, height=1).pack(fill="x", pady=(S5, 0))
+        self._label(wrap, title, bold=True).pack(anchor="w", pady=(S4, S3))
+        body = tk.Frame(wrap, bg=BG); body.pack(fill="x")
+        return body
+
+    def _caption(self, parent, text, margin=S3, color=MUT, bg=BG):
+        return self._wrap(self._label(parent, text, color=color, size=SMALL, bg=bg,
+                                      justify="left", anchor="w"), margin)
 
     def _build_settings(self):
         tk = self.tk
         self._settings = tk.Frame(self._body, bg=BG)
-        self._set_canvas, si = self._scrollable(self._settings)
+        self._set_canvas, si = self._scrollable(
+            self._settings, on_width=lambda w: self._rewrap(self._wrap_settings, w))
 
         # ---- 1. Распознавание -------------------------------------------
-        self._prov_card, pp, _ = self._section(si, "Распознавание")
-        self._prov_card.pack(fill="x", pady=(0, 10))
-        segwrap = tk.Frame(pp, bg=SURF); segwrap.pack(fill="x", pady=(10, 0))
-        self._prov_seg = self._segment(segwrap, [("☁  Groq — в облаке", "groq"),
-                                                 ("🖥  Локально — офлайн", "local")],
+        pp = self._section(si, "Распознавание", first=True)
+        self._prov_seg = self._segment(pp, [("Groq · основной", "groq"),
+                                            ("Офлайн · запасной", "local")],
                                        self._select_provider)
-        self._prov_sub = tk.Frame(pp, bg=SURF); self._prov_sub.pack(fill="x", pady=(12, 0))
+        self._prov_caption = self._caption(pp, "")
+        self._prov_caption.pack(fill="x", pady=(S2, 0))
+        self._prov_sub = tk.Frame(pp, bg=BG); self._prov_sub.pack(fill="x", pady=(S4, 0))
         self._build_groq_panel()
         self._build_local_panel()
 
-        # ---- 2. Хоткей --------------------------------------------------
-        self._hk_card, hp, hhead = self._section(si, "Сочетание для старта")
-        self._hk_card.pack(fill="x", pady=(0, 10))
-        hrow = tk.Frame(hp, bg=SURF); hrow.pack(fill="x", pady=(10, 0))
+        # ---- 2. Горячая клавиша -------------------------------------------
+        hp = self._section(si, "Горячая клавиша")
+        hrow = tk.Frame(hp, bg=BG); hrow.pack(fill="x")
         self.hotkey_var = tk.StringVar(value=self._pretty_key(self.ctrl.cfg.hotkey))
-        self.hotkey_chip = tk.Label(hrow, textvariable=self.hotkey_var, bg=BAR, fg=TXT,
-                                    font=_f(11), padx=12, pady=6,
-                                    highlightthickness=1, highlightbackground=BORDER2)
+        self.hotkey_chip = tk.Label(hrow, textvariable=self.hotkey_var, bg=SURF2, fg=TXT,
+                                    font=_f(BODY), padx=S3, pady=5,
+                                    highlightthickness=1, highlightbackground=SURF2)
         self.hotkey_chip.pack(side="left")
         self.capture_btn = self._btn(hrow, "Изменить…", self._begin_capture)
         self.capture_btn.pack(side="right")
-        self._label(hp, "Работает в любом окне. Во время записи: Enter — вставить, Esc — отменить.",
-                    color=MUT, size=9, bg=SURF, wraplength=400, justify="left").pack(anchor="w", pady=(8, 0))
+        self._caption(hp, "Запускает запись в любом окне. Остановить и вставить: "
+                          "клавиши в панели выше.").pack(fill="x", pady=(S2, 0))
 
         # ---- 3. Запись и хранилище --------------------------------------
-        self._limits_card, lp, _ = self._section(si, "Запись и хранилище")
-        self._limits_card.pack(fill="x")
-        self._max_sec_row = tk.Frame(lp, bg=SURF)
-        self._label(self._max_sec_row, "Авто-стоп через", color=SUB, size=10, bg=SURF).pack(side="left")
+        lp = self._section(si, "Запись и хранилище")
+        self._max_sec_row = tk.Frame(lp, bg=BG)
+        self._label(self._max_sec_row, "Авто-стоп через", color=SUB).pack(side="left")
         self.max_sec_var = tk.StringVar(value=str(self.ctrl.cfg.max_seconds))
         e1 = self._entry(self._max_sec_row, self.max_sec_var, width=5, center=True)
-        e1.pack(side="left", padx=(8, 6), ipady=3)
-        self._label(self._max_sec_row, "сек", color=MUT, size=10, bg=SURF).pack(side="left")
-        self._label(self._max_sec_row, "· Groq принимает до ~350 с", color=DIM, size=9,
-                    bg=SURF).pack(side="left", padx=(8, 0))
+        e1.pack(side="left", padx=(S2, 6), ipady=3)
+        self._label(self._max_sec_row, "сек", color=MUT).pack(side="left")
+        self._label(self._max_sec_row, "Groq принимает до ~350 с", color=MUT,
+                    size=SMALL).pack(side="right")
         self._bind_apply(e1, self._save_limits)
 
-        mb_row = tk.Frame(lp, bg=SURF); mb_row.pack(fill="x", pady=(10, 0))
+        mb_row = tk.Frame(lp, bg=BG); mb_row.pack(fill="x")
         self._mb_row = mb_row
-        self._label(mb_row, "Хранить аудио до", color=SUB, size=10, bg=SURF).pack(side="left")
+        self._label(mb_row, "Хранить аудио до", color=SUB).pack(side="left")
         self.max_mb_var = tk.StringVar(value=str(self.ctrl.cfg.max_storage_mb))
         e2 = self._entry(mb_row, self.max_mb_var, width=5, center=True)
-        e2.pack(side="left", padx=(8, 6), ipady=3)
-        self._label(mb_row, "МБ", color=MUT, size=10, bg=SURF).pack(side="left")
-        self._label(mb_row, "· 0 — без лимита", color=DIM, size=9, bg=SURF).pack(side="left", padx=(8, 0))
+        e2.pack(side="left", padx=(S2, 6), ipady=3)
+        self._label(mb_row, "МБ", color=MUT).pack(side="left")
+        self._label(mb_row, "0 = без лимита", color=MUT, size=SMALL).pack(side="right")
         self._bind_apply(e2, self._save_limits)
-        self._storage_usage = self._label(lp, "", color=MUT, size=9, bg=SURF)
-        self._storage_usage.pack(anchor="w", pady=(8, 0))
+        self._storage_usage = self._label(lp, "", color=MUT, size=SMALL)
+        self._storage_usage.pack(anchor="w", pady=(S2, S4))
 
         self._update_prov_seg()
 
@@ -529,133 +718,128 @@ class ControlPanel:
     # ---------------------------------------------------------- Groq panel
     def _build_groq_panel(self):
         tk = self.tk
-        g = tk.Frame(self._prov_sub, bg=SURF)
+        g = tk.Frame(self._prov_sub, bg=BG)
         self._groq_sub = g
-        self._label(g, "Модель", color=MUT, size=9, bg=SURF).pack(anchor="w", pady=(0, 6))
-        mw = tk.Frame(g, bg=SURF); mw.pack(fill="x")
+        self._label(g, "Модель", color=SUB, size=SMALL).pack(anchor="w", pady=(0, S2))
+        mw = tk.Frame(g, bg=BG); mw.pack(fill="x")
         self._seg = self._segment(mw, [("Turbo · быстрее", "whisper-large-v3-turbo"),
                                        ("Large v3 · точнее", "whisper-large-v3")],
                                   self._select_model)
-        krow_head = tk.Frame(g, bg=SURF); krow_head.pack(fill="x", pady=(14, 6))
-        self._label(krow_head, "Ключ API", color=MUT, size=9, bg=SURF).pack(side="left")
-        self.key_status = self._label(krow_head, "", color=MUT, size=9, bg=SURF)
+        krow_head = tk.Frame(g, bg=BG); krow_head.pack(fill="x", pady=(S4, S2))
+        self._label(krow_head, "Ключ API", color=SUB, size=SMALL).pack(side="left")
+        self.key_status = self._label(krow_head, "", color=MUT, size=SMALL)
         self.key_status.pack(side="right")
-        row = tk.Frame(g, bg=SURF); row.pack(fill="x")
+        row = tk.Frame(g, bg=BG); row.pack(fill="x")
         self.key_var = tk.StringVar()
         self.key_entry = self._entry(row, self.key_var, show="•")
-        self.key_entry.pack(side="left", expand=True, fill="x", ipady=4)
+        self.key_entry.pack(side="left", expand=True, fill="x", ipady=5)
         self._enable_clipboard(self.key_entry)
-        self._btn(row, "Сохранить", self._save_key, primary=True).pack(side="left", padx=(8, 4))
-        clr = tk.Label(row, text="✕", bg=SURF2, fg=MUT, font=_f(11), cursor="hand2", padx=10)
-        clr.pack(side="left", fill="y")
-        clr.bind("<Button-1>", lambda e: self._clear_key())
-        clr.bind("<Enter>", lambda e: clr.configure(fg=REC_H))
-        clr.bind("<Leave>", lambda e: clr.configure(fg=MUT))
-        self._groq_link_lbl = tk.Label(g, text="Бесплатный ключ — console.groq.com/keys →",
-                                       font=(FONT, 9, "underline"), bg=SURF, fg=ACC_H, cursor="hand2")
-        self._groq_link_lbl.bind("<Button-1>", lambda e: self._open_groq_keys())
+        self._icon_btn(row, "close", self._clear_key, "Удалить сохранённый ключ",
+                       hover_color=REC_T, fallback="✕").pack(side="right", padx=(S1, 0))
+        self._btn(row, "Сохранить", self._save_key, primary=True).pack(side="right", padx=(S2, 0))
+        self._groq_link_lbl = self._link(g, "Получить бесплатный ключ на console.groq.com",
+                                         self._open_groq_keys)
 
     # --------------------------------------------------------- Local panel
     def _build_local_panel(self):
         tk = self.tk
-        l = tk.Frame(self._prov_sub, bg=SURF)
+        l = tk.Frame(self._prov_sub, bg=BG)
         self._local_sub = l
 
-        # status strip
-        strip = tk.Frame(l, bg=SURF2, padx=10, pady=8)
-        strip.pack(fill="x")
-        self._loc_dot = tk.Canvas(strip, width=10, height=10, bg=SURF2, highlightthickness=0)
-        self._loc_dot.pack(side="left", pady=(2, 0))
-        self._loc_dot_id = self._loc_dot.create_oval(1, 1, 9, 9, fill=AMBER, outline="")
-        self._loc_head = tk.Label(strip, text="", bg=SURF2, fg=TXT, font=_f(9),
-                                  anchor="w", justify="left", wraplength=380)
-        self._loc_head.pack(side="left", padx=(8, 0), fill="x", expand=True)
+        # status line
+        strip = tk.Frame(l, bg=BG); strip.pack(fill="x")
+        self._loc_dot = tk.Canvas(strip, width=8, height=8, bg=BG, highlightthickness=0)
+        self._loc_dot.pack(side="left", anchor="n", pady=(5, 0))
+        self._loc_dot_id = self._loc_dot.create_oval(0, 0, 8, 8, fill=AMBER, outline="")
+        self._loc_head = self._wrap(self._label(strip, "", color=SUB, size=SMALL, anchor="w",
+                                                justify="left"), margin=S4)
+        self._loc_head.pack(side="left", padx=(S2, 0), fill="x", expand=True)
 
-        # step 1 — engine
-        s1 = tk.Frame(l, bg=SURF); s1.pack(fill="x", pady=(12, 0))
-        self._step_num(s1, "1")
-        col1 = tk.Frame(s1, bg=SURF); col1.pack(side="left", fill="x", expand=True, padx=(10, 0))
-        r1 = tk.Frame(col1, bg=SURF); r1.pack(fill="x")
-        self._label(r1, "Движок whisper.cpp", color=TXT, size=10, bg=SURF).pack(side="left")
-        self._eng_btn = self._btn(r1, "Установить · 8 МБ", self._install_engine, primary=True, small=True)
-        self._eng_btn.pack(side="right")
-        self._eng_state = self._label(col1, "", color=MUT, size=9, bg=SURF, anchor="w",
-                                      justify="left", wraplength=380)
-        self._eng_state.pack(fill="x", pady=(3, 0))
+        # engine
+        er = tk.Frame(l, bg=BG); er.pack(fill="x", pady=(S4, 0))
+        self._eng_btn = self._btn(er, "Установить · 8 МБ", self._install_engine, primary=True)
+        self._eng_btn.pack(side="right", anchor="n")
+        ecol = tk.Frame(er, bg=BG); ecol.pack(side="left", fill="x", expand=True)
+        self._label(ecol, "Движок whisper.cpp").pack(anchor="w")
+        self._eng_state = self._label(ecol, "", color=MUT, size=SMALL, anchor="w", justify="left")
+        self._eng_state.pack(fill="x", pady=(2, 0))
+        ecol.bind("<Configure>", lambda e: self._eng_state.configure(
+            wraplength=max(120, e.width - S3)))
+        self._eng_tip = _Tooltip(tk, self._eng_state, "")
 
-        # step 2 — model
-        s2 = tk.Frame(l, bg=SURF); s2.pack(fill="x", pady=(12, 0))
-        self._step_num(s2, "2")
-        col2 = tk.Frame(s2, bg=SURF); col2.pack(side="left", fill="x", expand=True, padx=(10, 0))
-        r2 = tk.Frame(col2, bg=SURF); r2.pack(fill="x")
-        self._label(r2, "Модель", color=TXT, size=10, bg=SURF).pack(side="left")
-        rescan = tk.Label(r2, text="⟳ найти на диске", bg=SURF, fg=ACC_H, font=_f(9), cursor="hand2")
-        rescan.pack(side="right")
-        rescan.bind("<Button-1>", lambda e: self._refresh_local(announce=True))
-        self._model_combo = tk.Frame(col2, bg=SURF2, cursor="hand2",
-                                     highlightthickness=1, highlightbackground=BORDER2)
-        self._model_combo.pack(fill="x", pady=(6, 0))
-        self._mc_name = tk.Label(self._model_combo, text="", bg=SURF2, fg=TXT, font=_f(10),
-                                 anchor="w", padx=10, pady=8, cursor="hand2")
+        # model: one compact dropdown row (name · slow tag · size · chevron)
+        mh = tk.Frame(l, bg=BG); mh.pack(fill="x", pady=(S4, S2))
+        self._label(mh, "Модель").pack(side="left")
+        self._icon_btn(mh, "retry", lambda: self._refresh_local(announce=True),
+                       "Найти модели на диске", fallback="Найти").pack(side="right")
+        self._model_combo = tk.Frame(l, bg=SURF2, cursor="hand2",
+                                     highlightthickness=1, highlightbackground=LINE2)
+        self._model_combo.pack(fill="x")
+        self._mc_name = tk.Label(self._model_combo, text="", bg=SURF2, fg=TXT, font=_f(BODY),
+                                 anchor="w", padx=S3, pady=6, cursor="hand2")
         self._mc_name.pack(side="left", fill="x", expand=True)
-        self._mc_chev = tk.Label(self._model_combo, text="▾", bg=SURF2, fg=MUT, font=_f(12),
-                                 padx=10, cursor="hand2")
-        self._mc_chev.pack(side="right")
-        self._mc_size = tk.Label(self._model_combo, text="", bg=SURF2, fg=MUT, font=_f(9), cursor="hand2")
-        self._mc_size.pack(side="right")
-        for w in (self._model_combo, self._mc_name, self._mc_chev, self._mc_size):
+        if self._icons_ok:
+            self._chev_img = _photo(tk, ui_icons.icon_png("chevron", SUB, box=20, glyph=14))
+            self._mc_chev = tk.Label(self._model_combo, image=self._chev_img, bg=SURF2,
+                                     padx=S2, cursor="hand2")
+        else:
+            self._mc_chev = tk.Label(self._model_combo, text="▾", bg=SURF2, fg=SUB,
+                                     font=_f(BODY), padx=S2, cursor="hand2")
+        self._mc_chev.pack(side="right", padx=(0, S1))
+        self._mc_size = tk.Label(self._model_combo, text="", bg=SURF2, fg=MUT, font=_f(SMALL),
+                                 cursor="hand2")
+        self._mc_size.pack(side="right", padx=(S2, 0))
+        self._mc_tag = tk.Label(self._model_combo, text="", bg=SURF2, fg=AMBER, font=_f(SMALL),
+                                cursor="hand2")
+        self._mc_tag.pack(side="right")
+        combo_parts = (self._model_combo, self._mc_name, self._mc_chev, self._mc_size, self._mc_tag)
+        for w in combo_parts:
             w.bind("<Button-1>", lambda e: self._show_model_picker())
+            w.bind("<Enter>", lambda e: [x.configure(bg=SURF3) for x in combo_parts])
+            w.bind("<Leave>", lambda e: [x.configure(bg=SURF2) for x in combo_parts])
+        self._mc_tip = _Tooltip(tk, self._mc_name, "")
 
         # progress (hidden until a download starts; shown right under the picker)
-        self._dl_frame = tk.Frame(col2, bg=SURF)
-        self._dl_label = tk.Label(self._dl_frame, text="", bg=SURF, fg=SUB, font=_f(9), anchor="w")
+        self._dl_frame = tk.Frame(l, bg=BG)
+        self._dl_label = self._label(self._dl_frame, "", color=SUB, size=SMALL, anchor="w")
         self._dl_label.pack(side="left", fill="x", expand=True)
-        self._dl_cancel_btn = tk.Label(self._dl_frame, text="Отменить", bg=SURF, fg=REC_H,
-                                       font=_f(9), cursor="hand2")
+        self._dl_cancel_btn = self._link(self._dl_frame, "Отменить", self._cancel_download)
         self._dl_cancel_btn.pack(side="right")
-        self._dl_cancel_btn.bind("<Button-1>", lambda e: self._cancel_download())
-        self._dl_bar = _Progress(tk, col2)
-        self._dl_hint = self._label(
-            col2, "Модели, которых ещё нет на диске, можно скачать прямо из этого списка ↑",
-            color=DIM, size=8, bg=SURF, anchor="w", justify="left", wraplength=380)
-        self._dl_hint.pack(fill="x", pady=(6, 0))
+        self._dl_bar = _Progress(tk, l, height=4, bg=BG, track=SURF2, fill=TXT)
+        self._dl_hint = self._caption(
+            l, "В списке моделей можно скачать Small (рекомендуем) или модель поменьше.")
 
         # manual
-        man = tk.Frame(col2, bg=SURF); man.pack(fill="x", pady=(12, 0))
-        self._label(man, "Уже есть файл?", color=DIM, size=9, bg=SURF).pack(side="left")
-        lk1 = tk.Label(man, text="Выбрать файл…", bg=SURF, fg=ACC_H, font=_f(9), cursor="hand2")
-        lk1.pack(side="left", padx=(6, 0)); lk1.bind("<Button-1>", lambda e: self._pick_file())
-        self._label(man, "·", color=DIM, size=9, bg=SURF).pack(side="left", padx=4)
-        lk2 = tk.Label(man, text="Папку…", bg=SURF, fg=ACC_H, font=_f(9), cursor="hand2")
-        lk2.pack(side="left"); lk2.bind("<Button-1>", lambda e: self._pick_folder())
-        self._label(man, "(ggml-*.bin, папка faster-whisper или whisper-cli.exe)",
-                    color=DIM, size=8, bg=SURF).pack(side="left", padx=(8, 0))
-
-    def _step_num(self, parent, n):
-        c = self.tk.Canvas(parent, width=22, height=22, bg=SURF, highlightthickness=0)
-        c.pack(side="left", anchor="n", pady=(1, 0))
-        c.create_oval(1, 1, 21, 21, fill=SURF3, outline="")
-        c.create_text(11, 11, text=n, fill=SUB, font=_f(9, True))
-        return c
+        man = tk.Frame(l, bg=BG); man.pack(fill="x", pady=(S3, 0))
+        self._man_row = man
+        self._label(man, "Уже есть модель?", color=MUT, size=SMALL).pack(side="left")
+        lk1 = self._link(man, "Выбрать файл…", self._pick_file)
+        lk1.pack(side="left", padx=(S2, 0))
+        lk2 = self._link(man, "Папку…", self._pick_folder)
+        lk2.pack(side="left", padx=(S2, 0))
+        for w in (lk1, lk2):
+            _Tooltip(tk, w, "Файл ggml-*.bin, папка модели faster-whisper\n"
+                            "или папка с whisper-cli.exe")
 
     # ----------------------------------------------------- Local: actions
     def _refresh_local(self, announce=False):
         st = self.ctrl.local_status()
         self._local_st = st
         ok = st.ready
-        self._loc_dot.itemconfigure(self._loc_dot_id, fill=GREEN if ok else AMBER)
-        self._loc_head.configure(text=st.headline(), fg=TXT if ok else AMBER)
+        slow = ok and st.selected.slow
+        self._loc_dot.itemconfigure(self._loc_dot_id, fill=(AMBER if slow else GREEN) if ok else AMBER)
+        self._loc_head.configure(text=st.headline(), fg=SUB if ok else AMBER)
         # engine
         if st.engine is not None:
             ver = eng.engine_version()
-            self._eng_state.configure(text=f"✓ установлен{(' · ' + ver) if ver else ''}  ·  {st.engine}", fg=GREEN)
+            self._eng_state.configure(text=f"Установлен{(' · ' + ver) if ver else ''}", fg=MUT)
+            self._eng_tip.text = str(st.engine)
             self._eng_btn.configure(text="Переустановить")
-            self._eng_btn.pack_forget()
-            self._eng_btn.pack(side="right")
             self._style_secondary(self._eng_btn)
         else:
-            self._eng_state.configure(text="Официальная сборка ggml-org (~8 МБ), работает на любом CPU. "
-                                           "Без Python и pip.", fg=DIM)
+            self._eng_state.configure(text="Официальная сборка ggml-org, ~8 МБ. "
+                                           "Работает на любом процессоре.", fg=MUT)
+            self._eng_tip.text = ""
             self._eng_btn.configure(text="Установить · 8 МБ")
             self._style_primary(self._eng_btn)
         # selected model
@@ -663,22 +847,24 @@ class ControlPanel:
             runnable = st.selected in st.runnable_models
             self._mc_name.configure(text=st.selected.name, fg=TXT if runnable else AMBER)
             self._mc_size.configure(text=st.selected.size_label)
+            self._mc_tag.configure(text="медленно" if st.selected.slow else "")
+            self._mc_tip.text = (
+                "На обычном процессоре эта модель распознаёт фразу дольше минуты.\n"
+                "Для диктовки лучше Small или Groq." if st.selected.slow else "")
         else:
             self._mc_name.configure(text="Модель не выбрана", fg=MUT)
             self._mc_size.configure(text="")
+            self._mc_tag.configure(text="")
+            self._mc_tip.text = ""
+        if st.models:
+            self._dl_hint.pack_forget()
+        elif not self._dl_hint.winfo_ismapped():
+            self._dl_hint.pack(fill="x", pady=(S2, 0), before=self._man_row)
         if announce:
             n = len(st.models)
             self._set_status_text(f"Найдено моделей: {n}" if n else
-                                  "Модели не найдены — скачайте одну из списка")
+                                  "Модели не найдены. Скачайте Small из списка")
         self._refresh_hero()
-
-    def _style_primary(self, b):
-        b.configure(bg=ACC, fg="#ffffff", activebackground=ACC_H)
-        b.bind("<Enter>", lambda e: b.configure(bg=ACC_H)); b.bind("<Leave>", lambda e: b.configure(bg=ACC))
-
-    def _style_secondary(self, b):
-        b.configure(bg=SURF2, fg=TXT, activebackground=SURF3)
-        b.bind("<Enter>", lambda e: b.configure(bg=SURF3)); b.bind("<Leave>", lambda e: b.configure(bg=SURF2))
 
     def _show_model_picker(self):
         tk = self.tk
@@ -695,58 +881,72 @@ class ControlPanel:
             return
         anchor = self._model_combo
         anchor.update_idletasks()
-        rx, ry, rw = anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height(), anchor.winfo_width()
+        rx, rw = anchor.winfo_rootx(), anchor.winfo_width()
         popup = tk.Toplevel(self.root)
         popup.overrideredirect(True)
-        popup.configure(bg=BORDER2)
+        popup.configure(bg=LINE2)
         self._popup = popup
+        body = tk.Frame(popup, bg=SURF2); body.pack(fill="both", expand=True, padx=1, pady=1)
         cur = st.selected.path if st.selected else None
+        if self._icons_ok:
+            check = _photo(tk, ui_icons.icon_png("check", TXT, box=16, glyph=14))
+            blank = tk.PhotoImage(width=16, height=16)
+            popup._imgs = (check, blank)
 
-        def _row(bgr):
-            r = tk.Frame(popup, bg=bgr, cursor="hand2"); r.pack(fill="x", pady=(0, 1))
-            return r
+        def row(title, meta, on_click, *, selected=False, dim=False, tag="", tag_fg=GREEN):
+            r = tk.Frame(body, bg=SURF2, cursor="hand2"); r.pack(fill="x")
+            if self._icons_ok:
+                mark = tk.Label(r, bg=SURF2, image=check if selected else blank, cursor="hand2")
+            else:
+                mark = tk.Label(r, bg=SURF2, fg=TXT, font=_f(SMALL), width=2,
+                                text="✓" if selected else "", cursor="hand2")
+            mark.pack(side="left", padx=(S2, 0))
+            a = tk.Label(r, text=title, bg=SURF2, fg=MUT if dim else TXT, font=_f(BODY),
+                         anchor="w", padx=S1, pady=6, cursor="hand2")
+            a.pack(side="left")
+            parts = [r, mark, a]
+            if tag:
+                t = tk.Label(r, text=tag, bg=SURF2, fg=tag_fg, font=_f(SMALL), cursor="hand2")
+                t.pack(side="left", padx=(S1, 0))
+                parts.append(t)
+            for i, (text, fg) in enumerate(reversed(meta)):     # rightmost first
+                m = tk.Label(r, text=text, bg=SURF2, fg=fg, font=_f(SMALL), cursor="hand2")
+                m.pack(side="right", padx=(S2, S3 if i == 0 else 0))
+                parts.append(m)
+            for w in parts:
+                w.bind("<Button-1>", lambda e: on_click())
+                w.bind("<Enter>", lambda e, ws=parts: [x.configure(bg=SURF3) for x in ws])
+                w.bind("<Leave>", lambda e, ws=parts: [x.configure(bg=SURF2) for x in ws])
 
-        # already on disk — pick to select
+        # already on disk: pick to select
         for m in st.models:
             runnable = m in st.runnable_models
-            active = m.path == cur
-            bgr = ACC if active else SURF2
-            fgr = "#ffffff" if active else (TXT if runnable else MUT)
-            row = _row(bgr)
-            via = "whisper.cpp" if m.kind == "ggml" else "faster-whisper"
+            meta = [(m.size_label, MUT)]
             if not runnable:
-                via += " · нет движка" if m.kind == "ggml" else " · нет библиотеки"
-            a = tk.Label(row, text=m.name, bg=bgr, fg=fgr, font=_f(10), anchor="w", padx=10, pady=6)
-            a.pack(side="left", fill="x", expand=True)
-            b = tk.Label(row, text=f"{m.size_label}  ·  {via}", bg=bgr,
-                         fg="#ffffff" if active else DIM, font=_f(8), padx=10)
-            b.pack(side="right")
-            for w in (row, a, b):
-                w.bind("<Button-1>", lambda e, p=m.path: self._pick_model(p))
+                meta.insert(0, ("нет движка" if m.kind == "ggml" else "нет faster-whisper", AMBER))
+            row(m.name, meta, lambda p=m.path: self._pick_model(p),
+                selected=m.path == cur, dim=not runnable,
+                tag="медленно" if m.slow else "", tag_fg=AMBER)
 
-        # not on disk yet — pick to download
+        # not on disk yet: pick to download
         if to_download:
             if st.models:
-                sep = tk.Frame(popup, bg=SURF3, height=1); sep.pack(fill="x", pady=2)
-            hdr = tk.Frame(popup, bg=BORDER2); hdr.pack(fill="x")
-            tk.Label(hdr, text="СКАЧАТЬ", bg=BORDER2, fg=DIM, font=_f(8, True),
-                     anchor="w", padx=10, pady=(4 if st.models else 8)).pack(fill="x")
+                tk.Frame(body, bg=LINE2, height=1).pack(fill="x", pady=(S1, 0))
+            tk.Label(body, text="Скачать", bg=SURF2, fg=MUT, font=_f(SMALL),
+                     anchor="w", padx=S3 + S1, pady=S1).pack(fill="x", pady=(S1, 0))
             for spec in to_download:
-                row = _row(SURF2)
-                title = spec.title + (" ★" if spec.recommended else "")
-                a = tk.Label(row, text=title, bg=SURF2, fg=TXT if not spec.recommended else AMBER,
-                             font=_f(10), anchor="w", padx=10, pady=6)
-                a.pack(side="left", fill="x", expand=True)
-                b = tk.Label(row, text=f"Скачать · {spec.size_label}", bg=SURF2,
-                             fg=ACC_H, font=_f(9), padx=10)
-                b.pack(side="right")
-                for w in (row, a, b):
-                    w.bind("<Button-1>", lambda e, s=spec: self._pick_download(s))
-                    w.bind("<Enter>", lambda e, ws=(row, a, b): [x.configure(bg=SURF3) for x in ws])
-                    w.bind("<Leave>", lambda e, ws=(row, a, b): [x.configure(bg=SURF2) for x in ws])
+                row(spec.title, [(spec.size_label, MUT)],
+                    lambda s=spec: self._pick_download(s),
+                    tag="рекомендуем" if spec.recommended else "")
+        tk.Frame(body, bg=SURF2, height=S1).pack(fill="x")
 
         popup.update_idletasks()
-        popup.geometry(f"{rw}x{popup.winfo_reqheight()}+{rx}+{ry}")
+        ph = popup.winfo_reqheight()
+        below = anchor.winfo_rooty() + anchor.winfo_height() + 2
+        # Flip above the field when the list would run off the bottom of the screen.
+        if below + ph > popup.winfo_screenheight() - 48:
+            below = max(0, anchor.winfo_rooty() - ph - 2)
+        popup.geometry(f"{rw}x{ph}+{rx}+{below}")
         popup.bind("<Escape>", lambda e: popup.destroy())
         popup.bind("<Destroy>", lambda e: setattr(self, "_popup", None), add="+")
 
@@ -793,15 +993,15 @@ class ControlPanel:
         self._run_download(spec.title, lambda prog, cancel:
                            self.ctrl.download_local_model(spec, progress=prog, cancel=cancel))
         if st.engine is None:
-            self._set_status_text("Не забудьте установить движок (шаг 1) — модель без него не запустится")
+            self._set_status_text("Не забудьте установить движок: без него модель не запустится")
 
     def _run_download(self, title: str, job):
         self._dl_running = True
         self._dl_cancel = threading.Event()
-        self._dl_frame.pack(fill="x", pady=(10, 4), before=self._dl_hint)
-        self._dl_bar.pack(fill="x", before=self._dl_hint)
+        self._dl_frame.pack(fill="x", pady=(S3, S1), after=self._model_combo)
+        self._dl_bar.pack(fill="x", after=self._dl_frame)
         self._dl_bar.set(0); self._dl_bar.pulse(True)
-        self._dl_label.configure(text=f"{title} — подключаюсь…")
+        self._dl_label.configure(text=f"{title}: подключаюсь…")
         t0 = time.monotonic()
         state = {"last": (0, t0)}
 
@@ -824,10 +1024,10 @@ class ControlPanel:
                             f" · ещё ~{int(left // 60)} мин" if left > 90 else
                             (f" · ещё ~{int(left)} с" if left > 0 else ""))
                     tot = eng.human_size(p.total) if p.total else "?"
-                    self._dl_label.configure(text=f"{title} — {eng.human_size(p.done)} из {tot}{speed}")
+                    self._dl_label.configure(text=f"{title}: {eng.human_size(p.done)} из {tot}{speed}")
                 elif p.phase in ("verify", "extract"):
                     self._dl_bar.pulse(True)
-                    self._dl_label.configure(text=f"{title} — {p.label.lower()}…")
+                    self._dl_label.configure(text=f"{title}: {p.label.lower()}…")
             self._post(ui)
 
         def worker():
@@ -875,19 +1075,27 @@ class ControlPanel:
         self._refresh_local(announce=True)
 
     # ----------------------------------------------------- provider switch
+    _PROV_CAPTION = {
+        "groq": "Основной режим: Whisper Large v3 в облаке Groq, фраза распознаётся "
+                "за секунду-две. Нужен бесплатный ключ.",
+        "local": "Запасной режим на случай, когда нет интернета. Распознаёт на вашем "
+                 "процессоре и заметно медленнее Groq.",
+    }
+
     def _select_provider(self, pid: str) -> None:
         self.ctrl.save_settings(provider=pid)
         self._update_prov_seg()
         if pid == "local":
             st = self.ctrl.local_status()
-            self._set_status_text("Локальный режим включён" if st.ready else
-                                  "Локальный режим: " + st.headline())
+            self._set_status_text("Офлайн-режим включён" if st.ready else
+                                  "Офлайн-режим: " + st.headline())
         else:
-            self._set_status_text("Режим: Groq (облако)")
+            self._set_status_text("Режим: Groq")
 
     def _update_prov_seg(self) -> None:
         cur = self.ctrl.cfg.provider
         self._paint_segment(self._prov_seg, cur)
+        self._prov_caption.configure(text=self._PROV_CAPTION.get(cur, ""))
         if cur == "groq":
             self._local_sub.pack_forget()
             self._groq_sub.pack(fill="x")
@@ -911,53 +1119,65 @@ class ControlPanel:
         tk = self.tk
         h = tk.Frame(self._body, bg=BG)
         self._history = h
-        bar = tk.Frame(h, bg=BG); bar.pack(fill="x", pady=(0, 8))
-        self._btn(bar, "↻ Повторить очередь", self._retry_queue, small=True).pack(side="left")
-        self._btn(bar, "Очистить", self._clear_history, small=True, danger=True).pack(side="right")
-        self._hist_canvas, self._hist_inner = self._scrollable(h)
+        bar = tk.Frame(h, bg=BG); bar.pack(fill="x", pady=(S3, S1), padx=(0, S2))
+        self._btn(bar, "Повторить очередь", self._retry_queue, small=True).pack(side="left")
+        self._icon_btn(bar, "trash", self._clear_history, "Очистить историю",
+                       hover_color=REC_T, fallback="Очистить").pack(side="right")
+        self._hist_canvas, self._hist_inner = self._scrollable(
+            h, on_width=lambda w: self._rewrap(self._wrap_history, w))
 
     def _refresh_history(self):
         tk = self.tk
         for w in self._hist_inner.winfo_children():
             w.destroy()
+        self._wrap_history = []
+        width = max(self._hist_canvas.winfo_width() - S2, 300)
         rows = self.ctrl.recent(self.HISTORY_LIMIT)
         if not rows:
-            e = tk.Frame(self._hist_inner, bg=BG); e.pack(fill="x", pady=30)
-            self._label(e, "Здесь появятся ваши диктовки", color=SUB, size=11).pack()
-            self._label(e, f"Нажмите {self._pretty_key(self.ctrl.cfg.hotkey)} в любом поле и говорите",
-                        color=DIM, size=9).pack(pady=(4, 0))
+            e = tk.Frame(self._hist_inner, bg=BG); e.pack(fill="x", pady=(S5 * 2, 0))
+            self._label(e, "Здесь появятся ваши диктовки", color=SUB).pack()
+            self._label(e, f"Нажмите {self._pretty_key(self.ctrl.cfg.hotkey)} в любом поле "
+                           "и говорите", color=MUT, size=SMALL).pack(pady=(S1, 0))
             return
-        tagmap = {"pending": ("в очереди", AMBER), "failed": ("ошибка", REC)}
-        for r in rows:
-            rc = _RCard(tk, self._hist_inner, radius=10)
-            rc.pack(fill="x", pady=3, padx=1)
-            card = rc.inner
-            top = tk.Frame(card, bg=SURF); top.pack(fill="x", padx=12, pady=(9, 2))
+        tagmap = {"pending": ("в очереди", AMBER), "failed": ("ошибка", REC_T)}
+        for i, r in enumerate(rows):
+            if i:
+                tk.Frame(self._hist_inner, bg=LINE, height=1).pack(fill="x")
+            item = tk.Frame(self._hist_inner, bg=BG); item.pack(fill="x", pady=(S2, S3))
+            top = tk.Frame(item, bg=BG); top.pack(fill="x")
             ts = time.strftime("%H:%M", time.localtime(r.ts))
             day = time.strftime("%d.%m", time.localtime(r.ts))
             today = time.strftime("%d.%m")
-            self._label(top, ts if day == today else f"{day} {ts}", color=MUT, size=9, bg=SURF).pack(side="left")
+            meta = [(ts if day == today else f"{day} {ts}", MUT)]
             if r.status in tagmap:
-                label, col = tagmap[r.status]
-                self._label(top, "· " + label, color=col, size=9, bg=SURF).pack(side="left", padx=(6, 0))
+                meta.append(tagmap[r.status])
             elif r.status == "cancelled":
                 has_audio = bool(r.audio_path)
-                self._label(top, "· отменено" + (" · аудио ещё ~60 с" if has_audio else ""),
-                            color=AMBER if has_audio else MUT, size=9, bg=SURF).pack(side="left", padx=(6, 0))
+                meta.append(("отменено" + (", аудио ещё ~60 с" if has_audio else ""),
+                             AMBER if has_audio else MUT))
             if r.provider:
-                self._label(top, "локально" if r.provider == "local" else "groq",
-                            color=DIM, size=8, bg=SURF).pack(side="right")
-            body = "(запись отменена)" if r.status == "cancelled" else (
-                r.text or "(нет текста — можно повторить)")
-            tk.Label(card, text=body, bg=SURF, fg=TXT if r.text else MUT, font=_f(10),
-                     wraplength=390, justify="left", anchor="w").pack(fill="x", padx=12)
-            btns = tk.Frame(card, bg=SURF); btns.pack(fill="x", padx=12, pady=(6, 9))
-            if r.text:
-                self._btn(btns, "⧉ Копировать", lambda t=r.text: self._copy_text(t), small=True).pack(side="left")
+                meta.append(("офлайн" if r.provider == "local" else "Groq", MUT))
+            for j, (text, fg) in enumerate(meta):
+                if j:
+                    self._label(top, "·", color=MUT, size=SMALL).pack(side="left", padx=S1)
+                self._label(top, text, color=fg, size=SMALL).pack(side="left")
+            acts = tk.Frame(top, bg=BG); acts.pack(side="right")
             if r.status == "cancelled" and r.audio_path:
-                self._btn(btns, "Оставить аудио", lambda i=r.id: self._keep_cancelled(i), small=True).pack(side="left", padx=(6, 0))
+                self._icon_btn(acts, "keep", lambda i=r.id: self._keep_cancelled(i),
+                               "Оставить аудио, чтобы распознать позже",
+                               fallback="Оставить").pack(side="left")
             elif r.status in ("pending", "failed") and r.audio_path:
-                self._btn(btns, "↻ Повторить", lambda i=r.id: self._retry_one(i), small=True).pack(side="left", padx=(6, 0))
+                self._icon_btn(acts, "retry", lambda i=r.id: self._retry_one(i),
+                               "Распознать ещё раз", fallback="Повторить").pack(side="left")
+            if r.text:
+                self._icon_btn(acts, "copy", lambda t=r.text: self._copy_text(t),
+                               "Копировать", fallback="Копировать").pack(side="left")
+            body = "Запись отменена" if r.status == "cancelled" else (
+                r.text or "Нет текста. Можно распознать ещё раз")
+            lbl = tk.Label(item, text=body, bg=BG, fg=TXT if r.text else MUT, font=_f(BODY),
+                           wraplength=width, justify="left", anchor="w")
+            lbl.pack(fill="x", pady=(2, 0))
+            self._wrap(lbl, 0, history=True)
 
     # ================================================================ key
     def _save_key(self):
@@ -971,19 +1191,19 @@ class ControlPanel:
         if not hasattr(self, "key_status"):
             return
         if self.ctrl.has_key():
-            self.key_status.configure(text=f"● сохранён · {self.ctrl.key_hint()}", fg=GREEN)
+            self.key_status.configure(text=f"Сохранён · {self.ctrl.key_hint()}", fg=GREEN)
             if not self.key_var.get():
                 self.key_var.set(self.ctrl.stored_key())
             self._groq_link_lbl.pack_forget()
         else:
-            self.key_status.configure(text="● не задан", fg=AMBER)
+            self.key_status.configure(text="Не задан", fg=AMBER)
             self.key_var.set("")
-            self._groq_link_lbl.pack(anchor="w", pady=(8, 0))
+            self._groq_link_lbl.pack(anchor="w", pady=(S2, 0))
 
     def _enable_clipboard(self, widget):
         widget.bind("<Key>", self._on_clip_key)
-        menu = self.tk.Menu(widget, tearoff=0, bg=SURF, fg=TXT,
-                            activebackground=ACC, activeforeground="#ffffff", bd=0)
+        menu = self.tk.Menu(widget, tearoff=0, bg=SURF2, fg=TXT,
+                            activebackground=SEL, activeforeground=TXT, bd=0)
         menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
         menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
         menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
@@ -1008,7 +1228,7 @@ class ControlPanel:
     def _begin_capture(self):
         self._capturing = True
         self.capture_btn.configure(text="Нажмите сочетание…")
-        self.hotkey_chip.configure(highlightbackground=ACC)
+        self.hotkey_chip.configure(highlightbackground=SUB)
         self.root.bind("<KeyPress>", self._on_capture_key)
         self.root.focus_set()
 
@@ -1033,7 +1253,7 @@ class ControlPanel:
         try: self.root.unbind("<KeyPress>")
         except Exception: pass
         self.capture_btn.configure(text="Изменить…")
-        self.hotkey_chip.configure(highlightbackground=BORDER2)
+        self.hotkey_chip.configure(highlightbackground=SURF2)
 
     def _start_hotkeys(self):
         try:
@@ -1043,7 +1263,7 @@ class ControlPanel:
             self._register_start_hotkey()
         except Exception:
             self._hk = None
-            self._set_status_text("Глобальный хоткей недоступен — используйте кнопку «Запись»")
+            self._set_status_text("Глобальная клавиша недоступна: запускайте запись кнопкой")
 
     def _register_start_hotkey(self):
         if not self._hk:
@@ -1067,7 +1287,7 @@ class ControlPanel:
                 self._rec_hk_ids.append(
                     self._hk.register(combo, lambda a=action: self.root.after(0, a)))
             except Exception:
-                self._set_status_text(f"«{combo}» не удалось назначить — остановите кнопкой в окне")
+                self._set_status_text(f"«{combo}» не удалось назначить. Остановите кнопкой в окне")
 
     def _unregister_rec_keys(self):
         if not self._hk:
@@ -1079,7 +1299,7 @@ class ControlPanel:
 
     def _hotkey_error(self, combo):
         self.root.after(0, lambda: self._set_status_text(
-            f"Сочетание «{combo}» занято другой программой — задайте другое.", error=True))
+            f"Сочетание «{combo}» занято другой программой. Задайте другое.", error=True))
 
     # ================================================================ misc actions
     def _copy_text(self, text: str):
@@ -1103,7 +1323,7 @@ class ControlPanel:
         if self.ctrl.cfg.provider == "local":
             self._max_sec_row.pack_forget()
         else:
-            self._max_sec_row.pack(fill="x", pady=(10, 0), before=self._mb_row)
+            self._max_sec_row.pack(fill="x", pady=(0, S3), before=self._mb_row)
 
     def _refresh_storage_usage(self):
         try:
@@ -1112,7 +1332,7 @@ class ControlPanel:
             if limit > 0:
                 self._storage_usage.configure(
                     text=f"Занято {used:.1f} МБ из {limit} МБ",
-                    fg=REC if used > limit * 0.9 else MUT)
+                    fg=REC_T if used > limit * 0.9 else MUT)
             else:
                 self._storage_usage.configure(text=f"Занято {used:.1f} МБ · аудио удаляется через "
                                                    f"{self.ctrl.cfg.audio_retention_days} дн.", fg=MUT)
@@ -1129,7 +1349,7 @@ class ControlPanel:
             mb = int(self.max_mb_var.get())
             if mb < 0: raise ValueError
         except ValueError:
-            self._set_status_text("Лимит хранилища: целое число МБ, 0 — без лимита", error=True); return
+            self._set_status_text("Лимит хранилища: целое число МБ, 0 = без лимита", error=True); return
         if ms == self.ctrl.cfg.max_seconds and mb == self.ctrl.cfg.max_storage_mb:
             return
         self.ctrl.save_settings(max_seconds=ms, max_storage_mb=mb)
@@ -1160,8 +1380,8 @@ class ControlPanel:
     def _clear_history(self):
         import tkinter.messagebox as mb
         if not mb.askyesno("Очистить историю?",
-                           "Все распознанные тексты и сохранённые аудио будут удалены. Это нельзя отменить.",
-                           parent=self.root):
+                           "Все распознанные тексты и сохранённые аудио будут удалены. "
+                           "Это нельзя отменить.", parent=self.root):
             return
         self.ctrl.clear_history(); self._refresh_history()
 
@@ -1177,24 +1397,19 @@ class ControlPanel:
             pass
 
     def _apply_status(self, state: State, message: str):
-        color, label, title = _STATE.get(state, _STATE[State.IDLE])
-        if state is State.IDLE:
-            chip_fill, dot_fill, text_fill, outline = ACC, GREEN, "#ffffff", ""
-        elif state is State.RECORDING:
-            chip_fill, dot_fill, text_fill, outline = REC, None, "#ffffff", ""
-        else:
-            chip_fill, dot_fill, text_fill, outline = SURF2, color, TXT, BORDER2
-        self._chip_cv.itemconfigure(self._chip_pill, fill=chip_fill, outline=outline)
-        self._chip_cv.itemconfigure(self._chip_txt, text=label, fill=text_fill)
-        self._chip_layout(label)
-        if state is State.RECORDING:
-            self._chip_cv.itemconfigure(self._chip_oval, state="hidden")
-            self._chip_cv.itemconfigure(self._chip_sq, state="normal")
-        else:
-            self._chip_cv.itemconfigure(self._chip_oval, fill=dot_fill, state="normal")
-            self._chip_cv.itemconfigure(self._chip_sq, state="hidden")
-        self._hero_dot.itemconfigure(self._hero_dot_id, fill=color)
+        _lamp, title = _STATE.get(state, _STATE[State.IDLE])
+        self._rec_state = state
+        self._paint_rec()
+        if not self._icons_ok:
+            self._rec_btn.configure(text="Стоп" if state is State.RECORDING else "Запись")
+        self._rec_tip.text = {
+            State.IDLE: f"Начать запись ({self._pretty_key(self.ctrl.cfg.hotkey)})",
+            State.RECORDING: "Остановить и вставить текст",
+            State.ERROR: "Начать запись",
+        }.get(state, title)
         self._hero_title.configure(text=title)
+        busy = state in (State.TRANSCRIBING, State.INJECTING)
+        self._hero_bar.pulse(busy, fill=AMBER if state is State.TRANSCRIBING else GREEN)
         if message and not message.startswith("Готов."):
             self._set_status_text(message)
         elif state is State.IDLE:
@@ -1203,13 +1418,22 @@ class ControlPanel:
             self.root.after(900, self._refresh_history)
 
     def _set_status_text(self, text: str, error: bool = False):
-        self.status_lbl.configure(text=text, fg=REC_H if error else MUT)
+        """Show ``text`` under the status title; empty text restores the engine line.
+
+        Info messages fade back to the engine line after 6 s; errors stay until
+        the next message so they can be read in full."""
         if self._status_after:
             try: self.root.after_cancel(self._status_after)
             except Exception: pass
             self._status_after = None
-        if text and not error and self.ctrl.state.state is State.IDLE:
-            self._status_after = self.root.after(6000, lambda: self.status_lbl.configure(text=""))
+        if not text:
+            self._status_msg = None
+            self._refresh_hero()
+            return
+        self._status_msg = (text, error)
+        self.status_lbl.configure(text=text, fg=REC_T if error else SUB)
+        if not error and self.ctrl.state.state is State.IDLE:
+            self._status_after = self.root.after(6000, lambda: self._set_status_text(""))
 
     def _on_close(self):
         try:

@@ -67,7 +67,8 @@ class LocalStatus:
         """One line for the status area — what works or what to do next."""
         if self.ready:
             via = "whisper.cpp" if self.selected.kind == "ggml" else "faster-whisper"
-            return f"Готово: {self.selected.name} · {self.selected.size_label} · {via}"
+            slow = " · медленно на CPU" if self.selected.slow else ""
+            return f"Готово: {self.selected.name} · {self.selected.size_label}{slow} · {via}"
         if self.engine is None and not self.faster_whisper:
             return "Нужен движок — установится одной кнопкой (~8 МБ)"
         if not self.models:
@@ -98,16 +99,16 @@ def diagnose(*, local_model: str = "", extra_dirs=()) -> LocalStatus:
 def pick_default(models: List[eng.LocalModel], engine: Optional[Path],
                  fw_ok: bool) -> Optional[eng.LocalModel]:
     """Best model that can actually run right now; prefers the catalog's
-    recommended one, then the biggest GGML, then any CT2."""
+    recommended one, then the biggest GGML that is not slow on a CPU, then any
+    CT2, and a slow (large) model only when nothing else is there."""
     runnable = [m for m in models if model_is_runnable(m, engine, fw_ok)]
     if not runnable:
         return models[0] if models else None
     for m in runnable:
         if m.spec and m.spec.recommended:
             return m
-    ggml = sorted((m for m in runnable if m.kind == "ggml"),
-                  key=lambda m: m.size_bytes, reverse=True)
-    return ggml[0] if ggml else runnable[0]
+    ranked = sorted(runnable, key=lambda m: (m.slow, m.kind != "ggml", -m.size_bytes))
+    return ranked[0]
 
 
 # Backwards-compatible helpers (older UI/tests import these names)

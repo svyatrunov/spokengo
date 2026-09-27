@@ -150,13 +150,16 @@ def _local_cmd(args) -> int:
     if args.action == "models":
         for m in eng.MODEL_CATALOG:
             print(f"  {m.id:<22} {m.size_label:>8}  {m.title}{'  ★' if m.recommended else ''}  — {m.blurb}")
+        print("\n  Медленные на CPU (скачиваются только явно, по id):")
+        for m in eng.SLOW_MODELS:
+            print(f"  {m.id:<22} {m.size_label:>8}  {m.title}  — {m.blurb}")
         return 0
     if args.action == "install":
         exe = eng.install_engine(progress=bar)
         print(f"\nДвижок установлен: {exe}  (работает: {eng.engine_selftest(exe)})")
         return 0
     if args.action == "download":
-        spec = eng.catalog_by_id(args.model or "large-v3-turbo-q5_0")
+        spec = eng.catalog_by_id(args.model or "small")
         if spec is None:
             print(f"Неизвестная модель: {args.model}. Список: spokengo local models")
             return 1

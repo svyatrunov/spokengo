@@ -120,3 +120,56 @@ def test_fail_fast_defaults():
     p = GroqProvider("sk")
     assert p.timeout <= 20            # short timeout, no minutes-long hang
     assert p.max_retries <= 1         # at most one retry -> errors quickly
+
+
+# ---------------------------------------------------------------- upload timeout
+def _capture_timeout():
+    seen = {}
+
+    def http(url, headers, fields, file_field, file_path, timeout):
+        seen.setdefault("timeouts", []).append(timeout)
+        return Resp(200, json.dumps({"text": "ok"}))
+    return http, seen
+
+
+def test_short_clip_keeps_fail_fast_timeout(tmp_path):
+    from spokengo.transcribe.groq_provider import BASE_TIMEOUT
+    f = tmp_path / "short.wav"; f.write_bytes(b"\0" * 200_000)       # ~6 s of 16 kHz mono
+    http, seen = _capture_timeout()
+    provider(http).transcribe(str(f), model="whisper-large-v3-turbo")
+    assert BASE_TIMEOUT <= seen["timeouts"][0] <= 20
+
+
+def test_long_recording_gets_time_to_upload(tmp_path):
+    """Regression: an ~18 MB WAV failed with 'The write operation timed out'
+    because the whole upload had to fit in a flat 15 s."""
+    f = tmp_path / "long.wav"
+    with open(f, "wb") as fh:
+        fh.truncate(18 * 1024 * 1024)          # sparse file, no 18 MB write
+    http, seen = _capture_timeout()
+    provider(http).transcribe(str(f), model="whisper-large-v3-turbo")
+    t = seen["timeouts"][0]
+    # Room for ~1 Mbit/s uplink: 18 MB needs ~150 s of pure transfer.
+    assert t >= 150
+
+
+def test_upload_timeout_scales_and_is_capped():
+    from spokengo.transcribe.groq_provider import MAX_TIMEOUT, upload_timeout
+    small, mid, huge = (upload_timeout(n) for n in (0, 5_000_000, 500_000_000))
+    assert small < mid < huge == MAX_TIMEOUT
+    assert upload_timeout(0, base=40.0) == 40.0          # explicit base is respected
+    assert upload_timeout(10**9, base=900.0) == 900.0    # never below the base
+
+
+def test_retry_uses_same_scaled_timeout(tmp_path):
+    f = tmp_path / "a.wav"
+    with open(f, "wb") as fh:
+        fh.truncate(10_000_000)
+    timeouts = []
+
+    def http(url, headers, fields, file_field, file_path, timeout):
+        timeouts.append(timeout)
+        return Resp(0, b"The write operation timed out") if len(timeouts) == 1 \
+            else Resp(200, json.dumps({"text": "ok"}))
+    assert provider(http).transcribe(str(f), model="m").text == "ok"
+    assert len(timeouts) == 2 and timeouts[0] == timeouts[1] > 100
