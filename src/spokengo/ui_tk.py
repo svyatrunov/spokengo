@@ -28,7 +28,10 @@ All app logic lives in GuiController; this module only draws and dispatches.
 """
 from __future__ import annotations
 
+import os
 import queue
+import subprocess
+import sys
 import threading
 import time
 from typing import Callable, List, Optional
@@ -1169,6 +1172,9 @@ class ControlPanel:
             elif r.status in ("pending", "failed") and r.audio_path:
                 self._icon_btn(acts, "retry", lambda i=r.id: self._retry_one(i),
                                "Распознать ещё раз", fallback="Повторить").pack(side="left")
+            if r.audio_path and os.path.exists(r.audio_path):
+                self._icon_btn(acts, "folder", lambda p=r.audio_path: self._reveal_audio(p),
+                               "Показать аудиофайл в проводнике", fallback="Файл").pack(side="left")
             if r.text:
                 self._icon_btn(acts, "copy", lambda t=r.text: self._copy_text(t),
                                "Копировать", fallback="Копировать").pack(side="left")
@@ -1313,6 +1319,23 @@ class ControlPanel:
 
     def _copy_last(self):
         self._copy_text(self.ctrl.last_text())
+
+    def _reveal_audio(self, path: str):
+        """Open Explorer with the recording's .wav pre-selected, so the file
+        is easy to find whether the dictation transcribed cleanly, failed, or
+        is still queued — the audio itself is always kept regardless."""
+        if not os.path.exists(path):
+            self._set_status_text("Аудиофайл больше не найден на диске", error=True)
+            return
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", path])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        except Exception as exc:
+            self._set_status_text(f"Не удалось открыть проводник: {exc}", error=True)
 
     def _open_groq_keys(self):
         import webbrowser

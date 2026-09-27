@@ -100,6 +100,9 @@ def _glyph(d, name, k, col, w, ox, oy):
     elif name == "keep":            # bookmark: keep the audio
         _line(d, [(4.5, 13), (4.5, 3.2), (11.5, 3.2), (11.5, 13), (8, 10.2), (4.5, 13)],
               k, col, w, ox, oy)
+    elif name == "folder":          # reveal the recording in Explorer
+        _line(d, [(2.6, 5.2), (2.6, 12.4), (13.4, 12.4), (13.4, 5.8), (8.4, 5.8),
+                   (7.2, 4.0), (2.6, 4.0), (2.6, 5.2)], k, col, w, ox, oy)
     else:
         raise ValueError(f"unknown icon {name!r}")
 

@@ -3,6 +3,14 @@
 All notable changes are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.12.1
+
+- **History: reveal a recording's .wav in Explorer.** Any row that still has
+  its audio file — successful, failed, pending, or cancelled-but-kept — gets
+  a folder icon button that opens Explorer with that exact file selected.
+  The audio is kept on disk independently of transcription status, so this
+  is the way back to it if a dictation never came out as text.
+
 ## 0.12.0
 
 - **Redesigned control panel.** Warm graphite instead of indigo on navy, with
