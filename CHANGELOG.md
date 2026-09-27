@@ -3,6 +3,40 @@
 All notable changes are documented here. This project uses
 [semantic versioning](https://semver.org/).
 
+## 0.11.0
+
+- **Local mode that actually works from the .exe.** The frozen build could never
+  import a `pip install`ed faster-whisper, so "Локально" was a dead end on any
+  machine but the dev one. SpokenGo now ships its own offline engine on demand:
+  the official whisper.cpp CLI (`whisper-bin-x64.zip`, ~8 MB, SHA-256 pinned)
+  plus GGML models downloaded from the Settings window with a progress bar and
+  cancel. No Python, pip, or terminal anywhere in the flow.
+- **Model discovery** looks everywhere a model could reasonably be: SpokenGo's
+  models folder, every HuggingFace cache location (`HF_HOME`,
+  `HUGGINGFACE_HUB_CACHE`, `~/.cache`, `%USERPROFILE%`, `%LOCALAPPDATA%`),
+  `~/whisper.cpp/models`, `Downloads`, and any folder you add. Files are
+  validated by their GGML magic, not by name. "Выбрать файл…" accepts a model,
+  a faster-whisper folder, or your own `whisper-cli.exe`.
+- **Robust on other people's PCs**: non-ASCII user names / temp paths are
+  routed around (whisper.cpp takes narrow C strings), the console window never
+  flashes, a 10-minute timeout guards long dictations, and every failure
+  (blocked network, corrupt file, missing VC++ runtime, wrong file) has a
+  specific, actionable message instead of a stack trace.
+- faster-whisper stays supported as an optional backend when the library is
+  importable (source installs); CT2 models appear in the same picker with an
+  explanation when they cannot run.
+- `spokengo local [status|install|download <id>|models]` — headless setup.
+- `spokengo transcribe <file.wav> [--provider groq|local] [--model ...] [--language ru]`
+  — re-run an existing recording through any provider and print the text,
+  bypassing the recorder, history and paste.
+- **UI refresh**: a hero card with live state, the hotkeys as key caps and the
+  active engine as a badge; the offline setup is a two-step checklist with a
+  status strip; every setting applies instantly (no more "Применить"); nothing
+  is clipped at the default window size; empty-state copy in History; a
+  version tag in the header.
+- Config: `local_model` may now point to a `.bin` file; new `local_model_dirs`
+  (list) and `local_threads` (0 = auto).
+
 ## 0.10.0
 
 - **Local mode** — transcribe offline with [faster-whisper](https://github.com/SYSTRAN/faster-whisper): no API key, no internet. Switch between cloud and local in one click (Settings → Провайдер). Models are auto-detected from the HuggingFace hub cache.

@@ -1,128 +1,216 @@
-"""Local faster-whisper provider. No API key needed — runs on CPU by default.
+"""Local (offline) provider with two interchangeable backends.
 
-Models are auto-detected from the HuggingFace hub cache by scanning for
-directories that contain a ctranslate2 model.bin file. The model is
-lazy-loaded on first transcription so startup stays fast.
+* **whisper.cpp** (``local_engine``) — the default. A tiny native CLI the app
+  downloads itself plus a GGML model file. Works from the frozen .exe.
+* **faster-whisper** — used only when the library is importable (source
+  install) and a CTranslate2 model directory is selected.
 
-Install dependency:  pip install faster-whisper
-Download a model:    huggingface-cli download Systran/faster-whisper-medium
+The backend is chosen per model: a ``.bin`` GGML file runs through
+whisper.cpp, a snapshot *directory* through faster-whisper. ``diagnose()``
+tells the UI exactly what is missing so the user never sees a dead end.
 """
 from __future__ import annotations
 
-import os
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from ..errors import ConfigError, ProviderError
+from . import local_engine as eng
 from .base import Transcript
 from .registry import register_provider
-
-
-def _hf_hub_cache() -> Path:
-    if "HUGGINGFACE_HUB_CACHE" in os.environ:
-        return Path(os.environ["HUGGINGFACE_HUB_CACHE"])
-    if "HF_HOME" in os.environ:
-        return Path(os.environ["HF_HOME"]) / "hub"
-    xdg = os.environ.get("XDG_CACHE_HOME")
-    if xdg:
-        return Path(xdg) / "huggingface" / "hub"
-    return Path.home() / ".cache" / "huggingface" / "hub"
-
-
-def find_local_whisper_models() -> list[str]:
-    """Return absolute snapshot paths for cached ctranslate2 faster-whisper models.
-
-    Each path can be passed directly to faster_whisper.WhisperModel().
-    """
-    hub = _hf_hub_cache()
-    if not hub.exists():
-        return []
-    results = []
-    for d in sorted(hub.iterdir()):
-        if not d.is_dir() or not d.name.startswith("models--"):
-            continue
-        snapshots = d / "snapshots"
-        if not snapshots.exists():
-            continue
-        for snap in sorted(snapshots.iterdir(), reverse=True):
-            if snap.is_dir() and (snap / "model.bin").exists():
-                results.append(str(snap))
-                break
-    return results
-
-
-def model_display(path: str) -> str:
-    """Human-readable name from a snapshot path.
-
-    e.g. .../models--Systran--faster-whisper-medium/snapshots/abc → Systran/faster-whisper-medium
-    """
-    p = Path(path)
-    folder = p.parent.parent.name  # "models--Systran--faster-whisper-medium"
-    parts = folder.replace("models--", "").split("--", 1)
-    return "/".join(parts)
-
-
-def model_size(path: str) -> str:
-    """Human-readable size of the model.bin file."""
-    model_bin = Path(path) / "model.bin"
-    if not model_bin.exists():
-        return "?"
-    size = model_bin.stat().st_size
-    if size >= 1_000_000_000:
-        return f"{size / 1_000_000_000:.1f} GB"
-    return f"{size / 1_000_000:.0f} MB"
 
 
 def faster_whisper_available() -> bool:
     try:
         import faster_whisper  # noqa: F401
         return True
-    except ImportError:
+    except Exception:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Discovery / diagnostics used by the UI and by the provider itself
+# ---------------------------------------------------------------------------
+def find_all_models(extra_dirs=(), selected: str = "") -> List[eng.LocalModel]:
+    """Every usable-or-nearly-usable model on the machine, GGML first."""
+    models = eng.find_ggml_models(extra_dirs) + eng.find_ct2_models(extra_dirs)
+    if selected:
+        picked = eng.classify_model_path(selected)
+        if picked and all(Path(m.path) != Path(picked.path) for m in models):
+            models.insert(0, picked)
+    return models
+
+
+def model_is_runnable(m: eng.LocalModel, engine: Optional[Path], fw_ok: bool) -> bool:
+    return (engine is not None) if m.kind == "ggml" else fw_ok
+
+
+@dataclass
+class LocalStatus:
+    engine: Optional[Path]
+    faster_whisper: bool
+    models: List[eng.LocalModel] = field(default_factory=list)
+    selected: Optional[eng.LocalModel] = None
+
+    @property
+    def ready(self) -> bool:
+        return self.selected is not None and model_is_runnable(
+            self.selected, self.engine, self.faster_whisper)
+
+    @property
+    def runnable_models(self) -> List[eng.LocalModel]:
+        return [m for m in self.models
+                if model_is_runnable(m, self.engine, self.faster_whisper)]
+
+    def headline(self) -> str:
+        """One line for the status area — what works or what to do next."""
+        if self.ready:
+            via = "whisper.cpp" if self.selected.kind == "ggml" else "faster-whisper"
+            return f"Готово: {self.selected.name} · {self.selected.size_label} · {via}"
+        if self.engine is None and not self.faster_whisper:
+            return "Нужен движок — установится одной кнопкой (~8 МБ)"
+        if not self.models:
+            return "Движок на месте, осталось скачать модель"
+        if self.selected is None:
+            return "Выберите модель из списка"
+        if self.selected.kind == "ct2":
+            return ("Эта модель для faster-whisper, а библиотека не установлена — "
+                    "скачайте GGML-модель ниже")
+        return "Для этой модели нужен движок whisper.cpp — установите его"
+
+
+def diagnose(*, local_model: str = "", extra_dirs=()) -> LocalStatus:
+    engine = eng.find_engine(extra_dirs)
+    fw = faster_whisper_available()
+    models = find_all_models(extra_dirs, local_model)
+    selected = None
+    if local_model:
+        for m in models:
+            if Path(m.path) == Path(local_model):
+                selected = m
+                break
+    if selected is None:
+        selected = pick_default(models, engine, fw)
+    return LocalStatus(engine=engine, faster_whisper=fw, models=models, selected=selected)
+
+
+def pick_default(models: List[eng.LocalModel], engine: Optional[Path],
+                 fw_ok: bool) -> Optional[eng.LocalModel]:
+    """Best model that can actually run right now; prefers the catalog's
+    recommended one, then the biggest GGML, then any CT2."""
+    runnable = [m for m in models if model_is_runnable(m, engine, fw_ok)]
+    if not runnable:
+        return models[0] if models else None
+    for m in runnable:
+        if m.spec and m.spec.recommended:
+            return m
+    ggml = sorted((m for m in runnable if m.kind == "ggml"),
+                  key=lambda m: m.size_bytes, reverse=True)
+    return ggml[0] if ggml else runnable[0]
+
+
+# Backwards-compatible helpers (older UI/tests import these names)
+def find_local_whisper_models() -> list[str]:
+    return [m.path for m in eng.find_ct2_models()]
+
+
+def model_display(path: str) -> str:
+    m = eng.classify_model_path(path)
+    if m:
+        return m.name
+    p = Path(path)
+    folder = p.parent.parent.name
+    if folder.startswith("models--"):
+        return "/".join(folder.replace("models--", "").split("--", 1))
+    return p.name
+
+
+def model_size(path: str) -> str:
+    m = eng.classify_model_path(path)
+    return m.size_label if m else "?"
+
+
+# ---------------------------------------------------------------------------
+# Provider
+# ---------------------------------------------------------------------------
 @register_provider("local")
 class LocalWhisperProvider:
     name = "local"
 
-    def __init__(self, model_path: str = ""):
+    def __init__(self, model_path: str = "", *, extra_dirs=(), threads: int = 0,
+                 engine_path: Optional[str] = None):
         self._model_path = model_path
-        self._model = None
+        self._extra_dirs = tuple(extra_dirs or ())
+        self._threads = threads
+        self._engine_path = Path(engine_path) if engine_path else None
+        self._resolved: Optional[eng.LocalModel] = None
+        self._fw_model = None
 
-    def _load(self):
-        if self._model is not None:
-            return self._model
-        try:
-            from faster_whisper import WhisperModel
-        except ImportError:
-            raise ConfigError(
-                "faster-whisper не установлен. "
-                "Выполните: pip install faster-whisper"
-            )
-        path = self._model_path
-        if not path:
-            found = find_local_whisper_models()
-            if not found:
+    # -- resolution ---------------------------------------------------------
+    def _resolve(self) -> eng.LocalModel:
+        if self._resolved is not None:
+            return self._resolved
+        if self._model_path:
+            m = eng.classify_model_path(self._model_path)
+            if m is None:
                 raise ConfigError(
-                    "Локальная модель не найдена. "
-                    "Скачайте: huggingface-cli download Systran/faster-whisper-medium"
-                )
-            path = found[0]
-        try:
-            self._model = WhisperModel(path, device="cpu", compute_type="int8")
-        except Exception as exc:
-            raise ProviderError(f"Не удалось загрузить модель: {exc}") from exc
-        return self._model
+                    "Выбранная локальная модель не найдена на диске — откройте "
+                    "Настройки → Локально и выберите другую.")
+        else:
+            st = diagnose(extra_dirs=self._extra_dirs)
+            if not st.ready:
+                raise ConfigError("Локальный режим не настроен: " + st.headline())
+            m = st.selected
+        self._resolved = m
+        return m
 
+    def _engine(self) -> Path:
+        exe = self._engine_path or eng.find_engine(self._extra_dirs)
+        if exe is None:
+            raise ConfigError(
+                "Движок whisper.cpp не установлен — нажмите «Установить движок» "
+                "в Настройках → Локально.")
+        return exe
+
+    # -- backends -----------------------------------------------------------
+    def _transcribe_ggml(self, m: eng.LocalModel, audio_path: str,
+                         language: Optional[str]) -> Transcript:
+        text = eng.run_engine(self._engine(), Path(m.path), Path(audio_path),
+                              language=language, threads=self._threads)
+        return Transcript(text=text, language=language)
+
+    def _transcribe_ct2(self, m: eng.LocalModel, audio_path: str,
+                        language: Optional[str]) -> Transcript:
+        if self._fw_model is None:
+            try:
+                from faster_whisper import WhisperModel
+            except Exception:
+                raise ConfigError(
+                    "Эта модель требует faster-whisper, которого нет в этой сборке. "
+                    "Скачайте GGML-модель в Настройках → Локально.")
+            try:
+                self._fw_model = WhisperModel(m.path, device="cpu", compute_type="int8")
+            except Exception as exc:
+                raise ProviderError(f"Не удалось загрузить модель: {exc}") from exc
+        segments, info = self._fw_model.transcribe(audio_path, language=language or None)
+        text = "".join(s.text for s in segments).strip()
+        return Transcript(text=text, language=getattr(info, "language", None),
+                          duration=getattr(info, "duration", None))
+
+    # -- public -------------------------------------------------------------
     def transcribe(self, audio_path: str, *, model: str = "",
                    language: Optional[str] = None) -> Transcript:
         try:
-            m = self._load()
-            segments, info = m.transcribe(audio_path, language=language or None)
-            text = "".join(s.text for s in segments).strip()
-            return Transcript(text=text, language=info.language,
-                              duration=info.duration)
-        except (ConfigError, ProviderError):
+            m = self._resolve()
+            if m.kind == "ggml":
+                return self._transcribe_ggml(m, audio_path, language)
+            return self._transcribe_ct2(m, audio_path, language)
+        except ProviderError:
             raise
+        except ConfigError as exc:
+            # Permanent (not queued for auto-retry) but the audio is kept in
+            # History, so the user can set things up and press «Повторить».
+            raise ProviderError(str(exc)) from exc
         except Exception as exc:
             raise ProviderError(f"Локальное распознавание не удалось: {exc}") from exc

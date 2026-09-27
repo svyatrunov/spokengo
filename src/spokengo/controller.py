@@ -54,7 +54,9 @@ def _default_recorder_factory(cfg: Config):
 def _default_provider_factory(cfg: Config):
     from .transcribe import get_provider
     if cfg.provider == "local":
-        return get_provider("local")(cfg.local_model)
+        return get_provider("local")(cfg.local_model,
+                                     extra_dirs=tuple(cfg.local_model_dirs),
+                                     threads=cfg.local_threads)
     key = get_key(cfg.provider)
     if not key:
         raise RuntimeError(f"API-ключ для '{cfg.provider}' не задан")
@@ -133,7 +135,8 @@ class GuiController:
     # --- settings ------------------------------------------------------
     def save_settings(self, *, hotkey=None, mode=None, model=None, language=None,
                       provider=None, store_audio=None, api_key=None,
-                      local_model=None, max_seconds=None, max_storage_mb=None) -> None:
+                      local_model=None, max_seconds=None, max_storage_mb=None,
+                      local_model_dirs=None, local_threads=None) -> None:
         if hotkey is not None: self.cfg.hotkey = hotkey
         if mode is not None: self.cfg.mode = mode
         if model is not None: self.cfg.model = model
@@ -143,6 +146,8 @@ class GuiController:
         if local_model is not None: self.cfg.local_model = local_model
         if max_seconds is not None: self.cfg.max_seconds = max_seconds
         if max_storage_mb is not None: self.cfg.max_storage_mb = max_storage_mb
+        if local_model_dirs is not None: self.cfg.local_model_dirs = list(local_model_dirs)
+        if local_threads is not None: self.cfg.local_threads = local_threads
         self.cfg.validate()
         save_config(self.cfg, self.root_dir / "config.toml")
         if api_key:  # only overwrite the stored key when a new one is supplied
@@ -153,6 +158,64 @@ class GuiController:
 
     def recent(self, n: int = 30) -> List[Record]:
         return self.storage.recent(n)
+
+    # --- local (offline) mode --------------------------------------------
+    def local_status(self):
+        """Engine + models + selection as the UI should show them."""
+        from .transcribe.local_provider import diagnose
+        return diagnose(local_model=self.cfg.local_model,
+                        extra_dirs=tuple(self.cfg.local_model_dirs))
+
+    def select_local_model(self, path: str) -> None:
+        self.save_settings(local_model=path)
+
+    def add_local_dir(self, folder: str) -> None:
+        """Remember a user-picked folder so its models/engine are found later."""
+        folder = str(folder or "").strip()
+        if not folder:
+            return
+        dirs = [d for d in self.cfg.local_model_dirs if d]
+        if folder not in dirs:
+            dirs.append(folder)
+        self.save_settings(local_model_dirs=dirs)
+
+    def use_local_file(self, path: str) -> bool:
+        """User picked a model file/folder in a dialog. Returns True if usable."""
+        from .transcribe.local_engine import classify_model_path, ENGINE_EXE
+        from pathlib import Path as _P
+        p = _P(path)
+        if p.is_file() and p.name.lower() == ENGINE_EXE.lower():
+            self.add_local_dir(str(p.parent))
+            self._emit(f"Движок подключён: {p}")
+            return True
+        m = classify_model_path(str(p))
+        if m is None:
+            self._emit("Это не модель Whisper: нужен файл ggml-*.bin (whisper.cpp) "
+                       "или папка faster-whisper с model.bin")
+            return False
+        self.add_local_dir(str(p.parent if p.is_file() else p))
+        self.save_settings(local_model=m.path)
+        self._emit(f"Модель выбрана: {m.name} · {m.size_label}")
+        return True
+
+    def install_local_engine(self, progress=None, cancel=None):
+        """Blocking; call from a worker thread. Returns the CLI path."""
+        from .transcribe import local_engine as eng
+        exe = eng.install_engine(progress=progress, cancel=cancel)
+        if not eng.engine_selftest(exe):
+            raise RuntimeError(
+                "Движок скачан, но не запускается. Чаще всего не хватает "
+                "Visual C++ Redistributable 2015-2022 (x64) — установите его с сайта Microsoft.")
+        self._emit(f"Движок whisper.cpp {eng.ENGINE_VERSION} установлен")
+        return exe
+
+    def download_local_model(self, spec, progress=None, cancel=None):
+        """Blocking; call from a worker thread. Selects the model when done."""
+        from .transcribe import local_engine as eng
+        dest = eng.download_model(spec, progress=progress, cancel=cancel)
+        self.save_settings(local_model=str(dest))
+        self._emit(f"Модель {spec.title} готова")
+        return dest
 
     def peek_target(self):
         """Current paste target (foreground app), for the live overlay. Safe to

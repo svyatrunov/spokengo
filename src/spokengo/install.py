@@ -42,6 +42,8 @@ def _find_gui_target() -> tuple[str, str]:
     pythonw = scripts / "pythonw.exe"
     if not pythonw.exists():
         pythonw = scripts / "python.exe"
+    if not pythonw.exists():                 # non-Windows dev checkout
+        pythonw = Path(sys.executable)
     return str(pythonw), "-m spokengo gui"
 
 

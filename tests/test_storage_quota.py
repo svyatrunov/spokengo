@@ -67,3 +67,34 @@ def test_eviction_still_trims_real_history_when_needed(tmp_path):
     assert s.audio_size_mb() <= 0.9
     left = [r.text for r in s.recent(50)]
     assert "t4" in left and "t0" not in left, "oldest goes first"
+
+
+def test_eviction_clears_oldest_tenth_in_one_sweep(tmp_path):
+    """On overflow we free real headroom — the oldest ~10% goes at once —
+    rather than deleting the single file that just barely clears the cap."""
+    s = Storage(tmp_path)
+    for i in range(20):
+        p = _wav(s, 100, f"rec{i:02d}.wav")
+        s.add(text=f"t{i}", provider="p", model="m", duration=1.0,
+              audio_path=p, ts=1000.0 + i)
+    total = s.audio_size_mb()
+    # one file's worth would already clear this cap
+    cap = total - (total / 20) * 0.5
+    deleted = s.evict_oldest(cap)
+    assert deleted == 2, "batch should be ceil(10% of 20) = 2, not the bare minimum of 1"
+    left = {r.text for r in s.recent(50)}
+    assert "t0" not in left and "t1" not in left and "t2" in left
+
+
+def test_eviction_batch_scales_with_history_size(tmp_path):
+    """A much bigger overflow still only takes one sweep of ~10%, repeated as
+    needed, never a single all-or-nothing wipe."""
+    s = Storage(tmp_path)
+    for i in range(50):
+        p = _wav(s, 50, f"rec{i:02d}.wav")
+        s.add(text=f"t{i}", provider="p", model="m", duration=1.0,
+              audio_path=p, ts=1000.0 + i)
+    cap = s.audio_size_mb() * 0.92  # one 10% sweep (removing 5 of 50) clears this
+    deleted = s.evict_oldest(cap)
+    assert deleted == 5, "one sweep should remove exactly 10% of 50, not everything"
+    assert s.audio_size_mb() <= cap

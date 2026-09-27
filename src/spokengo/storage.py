@@ -4,6 +4,7 @@ by an ``attempts`` counter so a stuck item never loops forever.
 """
 from __future__ import annotations
 
+import math
 import os
 import sqlite3
 import time
@@ -221,9 +222,15 @@ class Storage:
                 pass
         return removed
 
-    def evict_oldest(self, max_mb: float) -> int:
-        """Delete oldest records (audio + row) until the audio directory is under
-        max_mb. Returns number of records deleted. No-op when max_mb <= 0."""
+    def evict_oldest(self, max_mb: float, batch_fraction: float = 0.1) -> int:
+        """When storage is over quota, delete the oldest ``batch_fraction`` of
+        recordings (audio + row) in one sweep — at least one — and repeat until
+        the audio directory is back under ``max_mb``. Returns number of records
+        deleted. No-op when max_mb <= 0.
+
+        Deleting in ~10% batches (rather than trimming one file at a time right
+        up to the limit) buys real headroom after an overflow, so the next few
+        recordings don't immediately trigger another eviction."""
         if max_mb <= 0:
             return 0
         # Unreferenced files first: they count towards the quota, so leaving them
@@ -231,20 +238,22 @@ class Storage:
         self.purge_orphans()
         deleted = 0
         while self.audio_size_mb() > max_mb:
-            row = self._conn.execute(
+            rows = self._conn.execute(
                 "SELECT id, audio_path FROM transcripts"
-                " WHERE audio_path IS NOT NULL ORDER BY ts ASC LIMIT 1").fetchone()
-            if row is None:
+                " WHERE audio_path IS NOT NULL ORDER BY ts ASC").fetchall()
+            if not rows:
                 break
-            p = row["audio_path"]
-            if p:
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
-            self._conn.execute("DELETE FROM transcripts WHERE id=?", (row["id"],))
+            batch_n = max(1, math.ceil(len(rows) * batch_fraction))
+            for row in rows[:batch_n]:
+                p = row["audio_path"]
+                if p:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                self._conn.execute("DELETE FROM transcripts WHERE id=?", (row["id"],))
+                deleted += 1
             self._conn.commit()
-            deleted += 1
         return deleted
 
     def close(self) -> None:

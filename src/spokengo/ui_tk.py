@@ -1,34 +1,47 @@
-"""Tkinter control panel — dark theme. Hand-styled tk widgets (full control over
-the dark look), a Pillow-rendered rounded "hero" record button, custom tabs, and
-dark cards for settings + history. All app logic lives in GuiController.
+"""Tkinter control panel — dark theme, hand-styled widgets.
+
+Layout (top → bottom):
+  header   — wordmark + live record chip
+  hero     — big state card: what the app is doing, the hotkeys, current engine
+  tabs     — Настройки | История
+  settings — one card per concern: Распознавание (Groq / Локально), Хоткей,
+             Запись и хранилище. Every control applies instantly; there is no
+             "Apply" button anywhere.
+  local    — the offline setup lives entirely in the window: install the
+             whisper.cpp engine, download a model with a progress bar, or point
+             at a file/folder. Nothing ever tells the user to open a terminal.
+
+All app logic lives in GuiController; this module only draws and dispatches.
 """
 from __future__ import annotations
 
+import queue
+import threading
 import time
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from .controller import GuiController
 from .hotkeys import clipboard_action, combo_from_state
-from .overlay import _load_font
 from .state import State
-from .transcribe.groq_provider import KNOWN_MODELS
-from .transcribe.local_provider import (find_local_whisper_models,
-                                        model_display, model_size,
-                                        faster_whisper_available)
+from .transcribe import local_engine as eng
 
-# palette
-BG = "#161b29"; BAR = "#11151f"; SURF = "#1b2130"; SURF2 = "#262d40"
-BORDER = "#2a3147"; BORDER2 = "#343c56"
-TXT = "#eef1f7"; MUT = "#9aa3bd"; SUB = "#c4cadb"
-ACC = "#5b5ef0"; ACC_H = "#6d70f4"; REC = "#ef4444"; REC_H = "#f26d6d"
-GREEN = "#5fce86"; AMBER = "#f6be4f"; BLUE = "#5b8def"
+# ---------------------------------------------------------------- palette
+BG = "#141826"; BAR = "#0f1320"; SURF = "#1b2133"; SURF2 = "#262e45"; SURF3 = "#303a55"
+BORDER = "#2a3249"; BORDER2 = "#39425e"
+TXT = "#eef1f7"; SUB = "#c4cadb"; MUT = "#8f98b3"; DIM = "#6b7390"
+ACC = "#6366f1"; ACC_H = "#787bf5"; ACC_SOFT = "#2b2f6b"
+REC = "#ef4444"; REC_H = "#f26d6d"
+GREEN = "#4ade80"; GREEN_SOFT = "#173a2a"
+AMBER = "#fbbf24"; AMBER_SOFT = "#3d3216"
+BLUE = "#60a5fa"
+FONT = "Segoe UI"
 
-_DOT = {
-    State.IDLE: (GREEN, "Запись"),
-    State.RECORDING: (REC, "Стоп"),
-    State.TRANSCRIBING: (AMBER, "Распознаю"),
-    State.INJECTING: (BLUE, "Вставка"),
-    State.ERROR: (REC, "Ошибка"),
+_STATE = {
+    State.IDLE:         (GREEN, "Запись",    "Готов к диктовке"),
+    State.RECORDING:    (REC,   "Стоп",      "Слушаю…"),
+    State.TRANSCRIBING: (AMBER, "Распознаю", "Распознаю речь…"),
+    State.INJECTING:    (BLUE,  "Вставка",   "Вставляю текст…"),
+    State.ERROR:        (REC,   "Ошибка",    "Что-то пошло не так"),
 }
 
 
@@ -40,22 +53,24 @@ def _smooth_rect(canvas, x0, y0, x1, y1, r, **kw):
     return canvas.create_polygon(pts, smooth=True, **kw)
 
 
-class _RCard:
-    """Canvas-backed card with rounded corners.
+def _f(size=10, bold=False):
+    return (FONT, size, "bold" if bold else "normal")
 
-    .inner          — tk.Frame where you pack content
-    .pack(**kw)     — proxy to underlying canvas
-    .pack_forget()  — proxy
-    """
-    def __init__(self, tk_mod, parent, *, bg=SURF, border=BORDER, radius=10):
-        self._cv = tk_mod.Canvas(parent, bg=BG, highlightthickness=0, bd=0)
+
+class _RCard:
+    """Canvas-backed card with rounded corners. ``.inner`` is the content frame."""
+    def __init__(self, tk_mod, parent, *, bg=SURF, border=BORDER, radius=12, outer=BG):
+        self._cv = tk_mod.Canvas(parent, bg=outer, highlightthickness=0, bd=0)
         self.inner = tk_mod.Frame(self._cv, bg=bg)
-        self._bg = bg
-        self._bdr = border
-        self._r = radius
+        self._bg, self._bdr, self._r = bg, border, radius
         self._win = self._cv.create_window(1, 1, window=self.inner, anchor="nw")
         self._cv.bind("<Configure>", lambda e: self._cv.after_idle(self._draw))
         self.inner.bind("<Configure>", lambda e: self._cv.after_idle(self._draw))
+
+    def recolor(self, bg=None, border=None):
+        if bg: self._bg = bg; self.inner.configure(bg=bg)
+        if border: self._bdr = border
+        self._draw()
 
     def _draw(self):
         try:
@@ -72,14 +87,61 @@ class _RCard:
         except Exception:
             pass
 
-    def pack(self, **kw):
-        self._cv.pack(**kw)
+    def pack(self, **kw): self._cv.pack(**kw)
+    def pack_forget(self): self._cv.pack_forget()
+    def grid(self, **kw): self._cv.grid(**kw)
 
-    def pack_forget(self):
-        self._cv.pack_forget()
+
+class _Progress:
+    """Thin rounded progress bar on a canvas (determinate + indeterminate)."""
+    def __init__(self, tk_mod, parent, height=6, bg=SURF):
+        self.tk = tk_mod
+        self.cv = tk_mod.Canvas(parent, height=height, bg=bg, highlightthickness=0, bd=0)
+        self._h = height
+        self._frac = 0.0
+        self._pulse = None
+        self.cv.bind("<Configure>", lambda e: self._draw())
+
+    def set(self, frac: float):
+        self._frac = max(0.0, min(1.0, frac))
+        self._draw()
+
+    def _draw(self, offset: float = -1):
+        cv, h = self.cv, self._h
+        w = cv.winfo_width()
+        if w <= 2:
+            return
+        cv.delete("all")
+        _smooth_rect(cv, 0, 0, w, h, h // 2, fill=SURF3, outline="")
+        if offset >= 0:                      # indeterminate sweep
+            seg = w * 0.3
+            x0 = -seg + (w + seg) * offset
+            _smooth_rect(cv, max(0, x0), 0, min(w, x0 + seg), h, h // 2, fill=ACC, outline="")
+        elif self._frac > 0:
+            _smooth_rect(cv, 0, 0, max(h, w * self._frac), h, h // 2, fill=ACC, outline="")
+
+    def pulse(self, on: bool):
+        if on and self._pulse is None:
+            t0 = time.monotonic()
+
+            def tick():
+                self._draw(((time.monotonic() - t0) * 0.6) % 1.0)
+                self._pulse = self.cv.after(40, tick)
+            tick()
+        elif not on and self._pulse is not None:
+            try:
+                self.cv.after_cancel(self._pulse)
+            except Exception:
+                pass
+            self._pulse = None
+            self._draw()
+
+    def pack(self, **kw): self.cv.pack(**kw)
 
 
 class ControlPanel:
+    HISTORY_LIMIT = 50
+
     def __init__(self, controller: Optional[GuiController] = None):
         import tkinter as tk
         self.tk = tk
@@ -91,19 +153,22 @@ class ControlPanel:
         self._start_hk_id = None
         self._rec_hk_ids: List[int] = []
         self._capturing = False
-        self._model_popup: object = None
+        self._popup = None
+        self._ui_q: "queue.Queue[Callable[[], None]]" = queue.Queue()
+        self._dl_cancel: Optional[threading.Event] = None
+        self._dl_running = False
+        self._status_after = None
 
-        try:  # set AppUserModelID so Windows taskbar shows the SpokenGo icon
+        try:  # Windows taskbar: our own icon, not Python's
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "wind.slw.SpokenGo")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("wind.slw.SpokenGo")
         except Exception:
             pass
 
         self.root = tk.Tk()
         self.root.title("SpokenGo")
-        self.root.geometry("452x600")
-        self.root.minsize(430, 560)
+        self.root.geometry("500x680")
+        self.root.minsize(470, 600)
         self.root.configure(bg=BG)
         try:
             from .resources import icon_path
@@ -128,501 +193,785 @@ class ControlPanel:
         self.ctrl.on_cancelled = self._on_cancelled
         self._refresh_history()
         self._refresh_key_status()
-        self._render_hero()
-        self._on_status(State.IDLE, "Готов. Нажмите Запись или хоткей")
+        self._refresh_hero()
+        self._apply_status(State.IDLE, "")
         self._start_hotkeys()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(100, self._drain_ui_queue)
 
-    # ---------- small helpers ----------
-    def _card(self, parent):
-        return _RCard(self.tk, parent)
+    # ================================================================ helpers
+    def _card(self, parent, **kw):
+        return _RCard(self.tk, parent, **kw)
 
-    def _label(self, parent, text, color=TXT, size=10, bold=False, bg=BG):
-        return self.tk.Label(parent, text=text, bg=bg, fg=color,
-                             font=("Segoe UI", size, "bold" if bold else "normal"))
+    def _label(self, parent, text, color=TXT, size=10, bold=False, bg=BG, **kw):
+        return self.tk.Label(parent, text=text, bg=bg, fg=color, font=_f(size, bold), **kw)
 
-    def _btn(self, parent, text, cmd, primary=False):
+    def _btn(self, parent, text, cmd, primary=False, danger=False, small=False, bg=None):
+        base = ACC if primary else (bg or SURF2)
+        hover = ACC_H if primary else SURF3
+        fg = "#ffffff" if primary else (REC_H if danger else TXT)
         b = self.tk.Button(parent, text=text, command=cmd, relief="flat", bd=0,
-                           cursor="hand2", padx=12, pady=6,
-                           bg=(ACC if primary else SURF2),
-                           fg=("#ffffff" if primary else TXT),
-                           activebackground=(ACC_H if primary else SURF),
-                           activeforeground="#ffffff",
-                           font=("Segoe UI", 10))
+                           cursor="hand2", padx=(10 if small else 14), pady=(4 if small else 7),
+                           bg=base, fg=fg, activebackground=hover, activeforeground=fg,
+                           font=_f(9 if small else 10), highlightthickness=0)
+        b.bind("<Enter>", lambda e: b.configure(bg=hover))
+        b.bind("<Leave>", lambda e: b.configure(bg=base))
         return b
 
-    def _entry(self, parent, textvariable, show=None):
-        e = self.tk.Entry(parent, textvariable=textvariable, show=show,
+    def _entry(self, parent, textvariable, show=None, width=None, center=False):
+        e = self.tk.Entry(parent, textvariable=textvariable, show=show, width=width,
                           bg=BAR, fg=TXT, insertbackground=TXT, relief="flat",
                           highlightthickness=1, highlightbackground=BORDER2,
-                          highlightcolor=ACC, font=("Segoe UI", 11))
+                          highlightcolor=ACC, font=_f(11),
+                          justify="center" if center else "left")
         return e
 
-    # ---------- header ----------
+    def _segment(self, parent, items, on_pick, bg=SURF):
+        """Segmented control: list of (label, id). Returns dict id → label widget."""
+        seg = self.tk.Frame(parent, bg=BORDER2)
+        seg.pack(fill="x")
+        out = {}
+        for i, (label, sid) in enumerate(items):
+            b = self.tk.Label(seg, text=label, bg=SURF2, fg=MUT, font=_f(10),
+                              cursor="hand2", pady=8)
+            b.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 1, 0))
+            seg.grid_columnconfigure(i, weight=1)
+            b.bind("<Button-1>", lambda e, s=sid: on_pick(s))
+            out[sid] = b
+        return out
+
+    @staticmethod
+    def _paint_segment(seg: dict, current: str):
+        for sid, b in seg.items():
+            on = sid == current
+            b.configure(bg=ACC if on else SURF2, fg="#ffffff" if on else MUT)
+
+    def _pill(self, parent, text, fg, soft, bg=SURF):
+        """Small rounded status badge: ● text."""
+        f = self.tk.Frame(parent, bg=soft, padx=9, pady=2)
+        lbl = self.tk.Label(f, text=text, bg=soft, fg=fg, font=_f(9))
+        lbl.pack()
+        f._lbl = lbl
+        return f
+
+    def _post(self, fn: Callable[[], None]):
+        """Run ``fn`` on the Tk thread (from worker threads)."""
+        self._ui_q.put(fn)
+
+    def _drain_ui_queue(self):
+        try:
+            while True:
+                fn = self._ui_q.get_nowait()
+                try:
+                    fn()
+                except Exception:
+                    pass
+        except queue.Empty:
+            pass
+        self.root.after(60, self._drain_ui_queue)
+
+    # ================================================================ header
     def _build_header(self):
         tk = self.tk
         bar = tk.Frame(self.root, bg=BG)
-        bar.pack(fill="x", padx=20, pady=(18, 4))
-        self._label(bar, "SpokenGo", size=19, bold=True).pack(side="left")
+        bar.pack(fill="x", padx=22, pady=(18, 2))
+        left = tk.Frame(bar, bg=BG); left.pack(side="left")
+        self._label(left, "SpokenGo", size=19, bold=True).pack(side="left")
+        from . import __version__
+        self._label(left, f"v{__version__}", color=DIM, size=8).pack(side="left", padx=(8, 0), pady=(8, 0))
 
-        CHIP_H, CHIP_W = 34, 132
-        r = CHIP_H // 2
-        self._chip_cv = tk.Canvas(bar, width=CHIP_W, height=CHIP_H,
-                                   bg=BG, highlightthickness=0, bd=0, cursor="hand2")
+        CHIP_H, CHIP_W = 36, 136
+        self._chip_cv = tk.Canvas(bar, width=CHIP_W, height=CHIP_H, bg=BG,
+                                  highlightthickness=0, bd=0, cursor="hand2")
         self._chip_cv.pack(side="right")
-        self._chip_pill = _smooth_rect(
-            self._chip_cv, 0, 1, CHIP_W, CHIP_H - 1, r, fill=ACC, outline="")
-        # Items created at placeholder coords; _chip_layout positions them dynamically
+        self._chip_pill = _smooth_rect(self._chip_cv, 0, 1, CHIP_W, CHIP_H - 1, CHIP_H // 2,
+                                       fill=ACC, outline="")
         self._chip_oval = self._chip_cv.create_oval(0, 0, 1, 1, fill=GREEN, outline="")
-        self._chip_sq = self._chip_cv.create_rectangle(0, 0, 1, 1,
-                                                        fill="#ffffff", outline="", state="hidden")
-        # Text is always at fixed x (math: CHIP_W/2 + (DOT_R*2+gap)/2 = 66+9 = 75)
-        self._chip_txt = self._chip_cv.create_text(
-            75, CHIP_H // 2, text="Запись",
-            fill="#ffffff", anchor="center", font=("Segoe UI", 11))
-        self._chip_cv.bind("<Button-1>", lambda e: self._on_record_button())
-        self._chip_layout("Запись")  # position dot to balance with initial text
+        self._chip_sq = self._chip_cv.create_rectangle(0, 0, 1, 1, fill="#ffffff",
+                                                       outline="", state="hidden")
+        self._chip_txt = self._chip_cv.create_text(77, CHIP_H // 2, text="Запись",
+                                                   fill="#ffffff", anchor="center", font=_f(11))
+        self._chip_cv.bind("<Button-1>", lambda e: self.ctrl.toggle())
+        self._chip_layout("Запись")
 
-    # ---------- status row (below header) ----------
+    def _chip_layout(self, label: str) -> None:
+        try:
+            import tkinter.font as tkfont
+            tw = tkfont.Font(family=FONT, size=11).measure(label)
+        except Exception:
+            tw = max(1, len(label) * 7)
+        DOT_R, GAP, CHIP_W, CHIP_H = 5, 8, 136, 36
+        x0 = (CHIP_W - DOT_R * 2 - GAP - tw) / 2
+        dx, dy = x0 + DOT_R, CHIP_H // 2
+        self._chip_cv.coords(self._chip_oval, dx - DOT_R, dy - DOT_R, dx + DOT_R, dy + DOT_R)
+        self._chip_cv.coords(self._chip_sq, dx - 4, dy - 4, dx + 4, dy + 4)
+        self._chip_cv.coords(self._chip_txt, x0 + DOT_R * 2 + GAP + tw / 2, dy)
+
+    # ================================================================ hero
     def _build_hero(self):
         tk = self.tk
-        wrap = tk.Frame(self.root, bg=BG)
-        wrap.pack(fill="x", padx=20, pady=(6, 4))
-        self.status_lbl = self._label(wrap, "", color=MUT, size=9)
-        self.status_lbl.pack(side="left", anchor="w")
-        self._btn(wrap, "⧉ Копировать последний", self._copy_last).pack(side="right")
+        self._hero = self._card(self.root, bg=SURF, border=BORDER, radius=14)
+        self._hero.pack(fill="x", padx=22, pady=(12, 0))
+        h = tk.Frame(self._hero.inner, bg=SURF); h.pack(fill="x", padx=16, pady=14)
 
-    def _render_hero(self):
-        pass
+        top = tk.Frame(h, bg=SURF); top.pack(fill="x")
+        self._hero_dot = tk.Canvas(top, width=14, height=14, bg=SURF, highlightthickness=0)
+        self._hero_dot.pack(side="left", pady=(3, 0))
+        self._hero_dot_id = self._hero_dot.create_oval(2, 2, 12, 12, fill=GREEN, outline="")
+        self._hero_title = self._label(top, "Готов к диктовке", size=13, bold=True, bg=SURF)
+        self._hero_title.pack(side="left", padx=(8, 0))
+        self._hero_mode = self._pill(top, "", ACC_H, ACC_SOFT)
+        self._hero_mode.pack(side="right")
 
-    # ---------- tabs ----------
+        self._hero_keys = tk.Frame(h, bg=SURF); self._hero_keys.pack(fill="x", pady=(10, 0))
+        self._key_caps = {}
+        for name in ("start", "stop", "cancel"):
+            cap = tk.Label(self._hero_keys, text="", bg=BAR, fg=SUB, font=(FONT, 9),
+                           padx=7, pady=2, highlightthickness=1, highlightbackground=BORDER2)
+            hint = tk.Label(self._hero_keys, text="", bg=SURF, fg=MUT, font=_f(9))
+            self._key_caps[name] = (cap, hint)
+        self._layout_keycaps()
+
+        bottom = tk.Frame(h, bg=SURF); bottom.pack(fill="x", pady=(10, 0))
+        self.status_lbl = tk.Label(bottom, text="", bg=SURF, fg=MUT, font=_f(9),
+                                   anchor="w", justify="left", wraplength=300)
+        self.status_lbl.pack(side="left", fill="x", expand=True)
+        self._btn(bottom, "⧉ Последний текст", self._copy_last, small=True).pack(side="right")
+
+    def _layout_keycaps(self):
+        cfg = self.ctrl.cfg
+        for w in self._hero_keys.winfo_children():
+            w.pack_forget()
+        pairs = (("start", cfg.hotkey, "старт"), ("stop", cfg.stop_key, "вставить"),
+                 ("cancel", cfg.cancel_key, "отмена"))
+        for i, (name, key, what) in enumerate(pairs):
+            cap, hint = self._key_caps[name]
+            cap.configure(text=self._pretty_key(key))
+            hint.configure(text=what)
+            cap.pack(side="left", padx=((0 if i == 0 else 14), 0))
+            hint.pack(side="left", padx=(5, 0))
+
+    @staticmethod
+    def _pretty_key(k: str) -> str:
+        names = {"escape": "Esc", "enter": "Enter", "return": "Enter", "space": "Space",
+                 "ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "win": "Win"}
+        return " + ".join(names.get(p, p.upper() if len(p) == 1 else p.capitalize())
+                          for p in k.split("+"))
+
+    def _refresh_hero(self):
+        cfg = self.ctrl.cfg
+        if cfg.provider == "groq":
+            model = "Turbo" if "turbo" in cfg.model else "Large v3"
+            txt, fg, soft = f"☁  Groq · {model}", ACC_H, ACC_SOFT
+            if not self.ctrl.has_key():
+                txt, fg, soft = "☁  Groq · нет ключа", AMBER, AMBER_SOFT
+        else:
+            st = self.ctrl.local_status()
+            if st.ready:
+                name = st.selected.name.replace("Large v3 ", "").replace(" · ", " ")
+                if len(name) > 16:
+                    name = name[:15] + "…"
+                txt, fg, soft = f"🖥  Локально · {name}", GREEN, GREEN_SOFT
+            else:
+                txt, fg, soft = "🖥  Локально · не настроено", AMBER, AMBER_SOFT
+        self._hero_mode.configure(bg=soft)
+        self._hero_mode._lbl.configure(text=txt, bg=soft, fg=fg)
+        self._layout_keycaps()
+
+    # ================================================================ tabs
     def _build_tabs(self):
         bar = self.tk.Frame(self.root, bg=BG)
-        bar.pack(fill="x", padx=20, pady=(14, 0))
+        bar.pack(fill="x", padx=22, pady=(16, 0))
         self._tabs = {}
         for key, title in (("settings", "Настройки"), ("history", "История")):
             holder = self.tk.Frame(bar, bg=BG)
-            holder.pack(side="left", padx=(0, 20))
-            lbl = self._label(holder, title, color=MUT, size=11)
+            holder.pack(side="left", padx=(0, 22))
+            lbl = self._label(holder, title, color=MUT, size=11, cursor="hand2")
             lbl.pack()
             ind = self.tk.Frame(holder, bg=BG, height=2)
-            ind.pack(fill="x", pady=(7, 0))
+            ind.pack(fill="x", pady=(6, 0))
             lbl.bind("<Button-1>", lambda e, k=key: self._show_tab(k))
             self._tabs[key] = (lbl, ind)
-        sep = self.tk.Frame(self.root, bg=BORDER, height=1)
-        sep.pack(fill="x", padx=20)
+        self.tk.Frame(self.root, bg=BORDER, height=1).pack(fill="x", padx=22)
         self._body = self.tk.Frame(self.root, bg=BG)
-        self._body.pack(fill="both", expand=True, padx=20, pady=14)
+        self._body.pack(fill="both", expand=True, padx=22, pady=(12, 14))
+        self._active_scroll = None
+        self.root.bind_all("<MouseWheel>", self._on_scroll)
+        self.root.bind_all("<Button-4>", lambda e: self._scroll_by(-1))
+        self.root.bind_all("<Button-5>", lambda e: self._scroll_by(1))
 
     def _on_scroll(self, event):
+        self._scroll_by(int(-event.delta / 120))
+
+    def _scroll_by(self, units):
         if self._active_scroll:
-            self._active_scroll.yview_scroll(int(-event.delta / 120), "units")
+            self._active_scroll.yview_scroll(units, "units")
 
     def _show_tab(self, key):
         for k, (lbl, ind) in self._tabs.items():
             active = k == key
             lbl.configure(fg=TXT if active else MUT)
             ind.configure(bg=ACC if active else BG)
-        if hasattr(self, "_settings"):
-            self._settings.pack_forget()
-        if hasattr(self, "_history"):
-            self._history.pack_forget()
-        (self._settings if key == "settings" else self._history).pack(
-            fill="both", expand=True)
+        for w in (getattr(self, "_settings", None), getattr(self, "_history", None)):
+            if w is not None:
+                w.pack_forget()
+        (self._settings if key == "settings" else self._history).pack(fill="both", expand=True)
         if key == "settings":
-            self._active_scroll = self._set_canvas if hasattr(self, "_set_canvas") else None
-            if hasattr(self, "_storage_usage"):
-                self._refresh_storage_usage()
+            self._active_scroll = getattr(self, "_set_canvas", None)
+            self._refresh_storage_usage()
         else:
-            self._active_scroll = self._hist_canvas if hasattr(self, "_hist_canvas") else None
+            self._active_scroll = getattr(self, "_hist_canvas", None)
+            self._refresh_history()
 
-    # ---------- settings ----------
+    def _scrollable(self, parent):
+        """Canvas + dark scrollbar; returns (canvas, inner_frame)."""
+        import tkinter.ttk as ttk
+        tk = self.tk
+        st = ttk.Style()
+        try:
+            st.theme_use("clam")
+        except Exception:
+            pass
+        st.configure("Dark.Vertical.TScrollbar", background=SURF2, troughcolor=BG,
+                     bordercolor=BG, lightcolor=SURF2, darkcolor=SURF2, arrowcolor=BG,
+                     gripcount=0, relief="flat", width=6)
+        st.map("Dark.Vertical.TScrollbar", background=[("active", BORDER2), ("pressed", ACC)])
+        try:
+            st.layout("Dark.Vertical.TScrollbar", [("Vertical.Scrollbar.trough", {"sticky": "ns", "children": [
+                ("Vertical.Scrollbar.thumb", {"expand": 1, "sticky": "nswe"})]})])
+        except Exception:
+            pass
+        wrap = tk.Frame(parent, bg=BG); wrap.pack(fill="both", expand=True)
+        cv = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
+        sb = ttk.Scrollbar(wrap, orient="vertical", command=cv.yview,
+                           style="Dark.Vertical.TScrollbar")
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y", padx=(6, 0))
+        cv.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(cv, bg=BG)
+        win = cv.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+        cv.bind("<Configure>", lambda e: cv.itemconfig(win, width=e.width))
+        return cv, inner
+
+    # ================================================================ settings
+    def _section(self, parent, title, subtitle=None):
+        card = self._card(parent)
+        body = self.tk.Frame(card.inner, bg=SURF)
+        body.pack(fill="x", padx=14, pady=(12, 13))
+        head = self.tk.Frame(body, bg=SURF); head.pack(fill="x")
+        self._label(head, title, color=TXT, size=10, bold=True, bg=SURF).pack(side="left")
+        if subtitle:
+            self._label(head, subtitle, color=DIM, size=9, bg=SURF).pack(side="left", padx=(8, 0))
+        return card, body, head
+
     def _build_settings(self):
         tk = self.tk
-        s = tk.Frame(self._body, bg=BG)
-        self._settings = s
+        self._settings = tk.Frame(self._body, bg=BG)
+        self._set_canvas, si = self._scrollable(self._settings)
 
-        # Scrollable canvas with scrollbar (same visual style as history)
-        import tkinter.ttk as ttk
-        _st = ttk.Style()
-        _st.theme_use("clam")
-        _st.configure("Dark.Vertical.TScrollbar",
-                      background=SURF2, troughcolor=BAR,
-                      bordercolor=BG, arrowcolor=BORDER2,
-                      gripcount=0, relief="flat")
-        _st.map("Dark.Vertical.TScrollbar",
-                background=[("active", BORDER2), ("pressed", ACC)],
-                arrowcolor=[("active", MUT)])
-        set_wrap = tk.Frame(s, bg=BG); set_wrap.pack(fill="both", expand=True)
-        self._set_canvas = tk.Canvas(set_wrap, bg=BG, highlightthickness=0, bd=0)
-        set_sb = ttk.Scrollbar(set_wrap, orient="vertical", command=self._set_canvas.yview,
-                               style="Dark.Vertical.TScrollbar")
-        self._set_canvas.configure(yscrollcommand=set_sb.set)
-        set_sb.pack(side="right", fill="y")
-        self._set_canvas.pack(side="left", fill="both", expand=True)
-        si = tk.Frame(self._set_canvas, bg=BG)
-        self._set_win = self._set_canvas.create_window((0, 0), window=si, anchor="nw")
-        si.bind("<Configure>",
-                lambda e: self._set_canvas.configure(scrollregion=self._set_canvas.bbox("all")))
-        self._set_canvas.bind("<Configure>",
-                              lambda e: self._set_canvas.itemconfig(self._set_win, width=e.width))
+        # ---- 1. Распознавание -------------------------------------------
+        self._prov_card, pp, _ = self._section(si, "Распознавание")
+        self._prov_card.pack(fill="x", pady=(0, 10))
+        segwrap = tk.Frame(pp, bg=SURF); segwrap.pack(fill="x", pady=(10, 0))
+        self._prov_seg = self._segment(segwrap, [("☁  Groq — в облаке", "groq"),
+                                                 ("🖥  Локально — офлайн", "local")],
+                                       self._select_provider)
+        self._prov_sub = tk.Frame(pp, bg=SURF); self._prov_sub.pack(fill="x", pady=(12, 0))
+        self._build_groq_panel()
+        self._build_local_panel()
 
-        # 1. Provider + model (first; _repack_settings handles actual packing)
-        self._prov_card = self._card(si)
-        pp = tk.Frame(self._prov_card.inner, bg=SURF); pp.pack(fill="x", padx=13, pady=12)
-        self._label(pp, "Провайдер", color=SUB, size=10, bg=SURF).pack(anchor="w")
-        pseg = tk.Frame(pp, bg=BORDER2); pseg.pack(fill="x", pady=(9, 0))
-        self._prov_seg = {}
-        for i, (label, pid) in enumerate([("☁  Groq", "groq"),
-                                           ("🖥  Локально", "local")]):
-            b = tk.Label(pseg, text=label, bg=SURF2, fg=MUT,
-                         font=("Segoe UI", 10), cursor="hand2", pady=7)
-            b.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 1, 0))
-            pseg.grid_columnconfigure(i, weight=1)
-            b.bind("<Button-1>", lambda e, p=pid: self._select_provider(p))
-            self._prov_seg[pid] = b
-        sub_wrap = tk.Frame(pp, bg=SURF); sub_wrap.pack(fill="x", pady=(10, 0))
-        self._groq_sub = tk.Frame(sub_wrap, bg=SURF)
-        self._label(self._groq_sub, "Модель", color=MUT, size=9,
-                    bg=SURF).pack(anchor="w", pady=(0, 6))
-        seg = tk.Frame(self._groq_sub, bg=BORDER2); seg.pack(fill="x")
-        self._seg = {}
-        for i, (label, mid) in enumerate([("Turbo · быстрее", "whisper-large-v3-turbo"),
-                                           ("Large v3 · точнее", "whisper-large-v3")]):
-            b = tk.Label(seg, text=label, bg=SURF2, fg=MUT,
-                         font=("Segoe UI", 10), cursor="hand2", pady=7)
-            b.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 1, 0))
-            seg.grid_columnconfigure(i, weight=1)
-            b.bind("<Button-1>", lambda e, m=mid: self._select_model(m))
-            self._seg[mid] = b
-        self._local_sub = tk.Frame(sub_wrap, bg=SURF)
-        self._label(self._local_sub, "Модель", color=MUT, size=9,
-                    bg=SURF).pack(anchor="w", pady=(0, 5))
-        self._local_model_frame = tk.Frame(self._local_sub, bg=SURF)
-        self._local_model_frame.pack(fill="x")
-        self._local_no_model = self._label(self._local_sub, "", color=AMBER,
-                                           size=8, bg=SURF)
-        self._local_no_model.pack(anchor="w", pady=(4, 0))
-        self._local_model_btns: dict = {}
+        # ---- 2. Хоткей --------------------------------------------------
+        self._hk_card, hp, hhead = self._section(si, "Сочетание для старта")
+        self._hk_card.pack(fill="x", pady=(0, 10))
+        hrow = tk.Frame(hp, bg=SURF); hrow.pack(fill="x", pady=(10, 0))
+        self.hotkey_var = tk.StringVar(value=self._pretty_key(self.ctrl.cfg.hotkey))
+        self.hotkey_chip = tk.Label(hrow, textvariable=self.hotkey_var, bg=BAR, fg=TXT,
+                                    font=_f(11), padx=12, pady=6,
+                                    highlightthickness=1, highlightbackground=BORDER2)
+        self.hotkey_chip.pack(side="left")
+        self.capture_btn = self._btn(hrow, "Изменить…", self._begin_capture)
+        self.capture_btn.pack(side="right")
+        self._label(hp, "Работает в любом окне. Во время записи: Enter — вставить, Esc — отменить.",
+                    color=MUT, size=9, bg=SURF, wraplength=400, justify="left").pack(anchor="w", pady=(8, 0))
 
-        # 2. API key — only packed when provider == "groq"
-        self._key_card = self._card(si)
-        kp = tk.Frame(self._key_card.inner, bg=SURF); kp.pack(fill="x", padx=13, pady=12)
-        top = tk.Frame(kp, bg=SURF); top.pack(fill="x")
-        self._label(top, "Ключ API (Groq)", color=SUB, size=10, bg=SURF).pack(side="left")
-        self.key_status = self._label(top, "", color=MUT, size=9, bg=SURF)
+        # ---- 3. Запись и хранилище --------------------------------------
+        self._limits_card, lp, _ = self._section(si, "Запись и хранилище")
+        self._limits_card.pack(fill="x")
+        self._max_sec_row = tk.Frame(lp, bg=SURF)
+        self._label(self._max_sec_row, "Авто-стоп через", color=SUB, size=10, bg=SURF).pack(side="left")
+        self.max_sec_var = tk.StringVar(value=str(self.ctrl.cfg.max_seconds))
+        e1 = self._entry(self._max_sec_row, self.max_sec_var, width=5, center=True)
+        e1.pack(side="left", padx=(8, 6), ipady=3)
+        self._label(self._max_sec_row, "сек", color=MUT, size=10, bg=SURF).pack(side="left")
+        self._label(self._max_sec_row, "· Groq принимает до ~350 с", color=DIM, size=9,
+                    bg=SURF).pack(side="left", padx=(8, 0))
+        self._bind_apply(e1, self._save_limits)
+
+        mb_row = tk.Frame(lp, bg=SURF); mb_row.pack(fill="x", pady=(10, 0))
+        self._mb_row = mb_row
+        self._label(mb_row, "Хранить аудио до", color=SUB, size=10, bg=SURF).pack(side="left")
+        self.max_mb_var = tk.StringVar(value=str(self.ctrl.cfg.max_storage_mb))
+        e2 = self._entry(mb_row, self.max_mb_var, width=5, center=True)
+        e2.pack(side="left", padx=(8, 6), ipady=3)
+        self._label(mb_row, "МБ", color=MUT, size=10, bg=SURF).pack(side="left")
+        self._label(mb_row, "· 0 — без лимита", color=DIM, size=9, bg=SURF).pack(side="left", padx=(8, 0))
+        self._bind_apply(e2, self._save_limits)
+        self._storage_usage = self._label(lp, "", color=MUT, size=9, bg=SURF)
+        self._storage_usage.pack(anchor="w", pady=(8, 0))
+
+        self._update_prov_seg()
+
+    def _bind_apply(self, entry, fn):
+        entry.bind("<Return>", lambda e: (fn(), self.root.focus_set()))
+        entry.bind("<FocusOut>", lambda e: fn())
+
+    # ---------------------------------------------------------- Groq panel
+    def _build_groq_panel(self):
+        tk = self.tk
+        g = tk.Frame(self._prov_sub, bg=SURF)
+        self._groq_sub = g
+        self._label(g, "Модель", color=MUT, size=9, bg=SURF).pack(anchor="w", pady=(0, 6))
+        mw = tk.Frame(g, bg=SURF); mw.pack(fill="x")
+        self._seg = self._segment(mw, [("Turbo · быстрее", "whisper-large-v3-turbo"),
+                                       ("Large v3 · точнее", "whisper-large-v3")],
+                                  self._select_model)
+        krow_head = tk.Frame(g, bg=SURF); krow_head.pack(fill="x", pady=(14, 6))
+        self._label(krow_head, "Ключ API", color=MUT, size=9, bg=SURF).pack(side="left")
+        self.key_status = self._label(krow_head, "", color=MUT, size=9, bg=SURF)
         self.key_status.pack(side="right")
-        row = tk.Frame(kp, bg=SURF); row.pack(fill="x", pady=(9, 0))
+        row = tk.Frame(g, bg=SURF); row.pack(fill="x")
         self.key_var = tk.StringVar()
         self.key_entry = self._entry(row, self.key_var, show="•")
         self.key_entry.pack(side="left", expand=True, fill="x", ipady=4)
         self._enable_clipboard(self.key_entry)
-        self._btn(row, "Сохранить", self._save_key, primary=True).pack(side="left", padx=(8, 5))
-        clr = tk.Label(row, text="\u2715", bg=SURF2, fg=MUT, font=("Segoe UI", 11),
-                       cursor="hand2", padx=10)
+        self._btn(row, "Сохранить", self._save_key, primary=True).pack(side="left", padx=(8, 4))
+        clr = tk.Label(row, text="✕", bg=SURF2, fg=MUT, font=_f(11), cursor="hand2", padx=10)
         clr.pack(side="left", fill="y")
         clr.bind("<Button-1>", lambda e: self._clear_key())
         clr.bind("<Enter>", lambda e: clr.configure(fg=REC_H))
         clr.bind("<Leave>", lambda e: clr.configure(fg=MUT))
-        self._groq_link_lbl = tk.Label(
-            kp, text="\u041f\u043e\u043b\u0443\u0447\u0438\u0442\u0435 \u0431\u0435\u0441\u043f\u043b\u0430\u0442\u043d\u044b\u0439 \u043a\u043b\u044e\u0447 \u043d\u0430 Groq Console \u2192",
-            font=("Segoe UI", 9, "underline"), bg=SURF, fg=ACC, cursor="hand2")
+        self._groq_link_lbl = tk.Label(g, text="Бесплатный ключ — console.groq.com/keys →",
+                                       font=(FONT, 9, "underline"), bg=SURF, fg=ACC_H, cursor="hand2")
         self._groq_link_lbl.bind("<Button-1>", lambda e: self._open_groq_keys())
-        self._groq_link_lbl.bind("<Enter>", lambda e: self._groq_link_lbl.configure(fg=ACC_H))
-        self._groq_link_lbl.bind("<Leave>", lambda e: self._groq_link_lbl.configure(fg=ACC))
 
-        # 3. Limits: max recording length + storage quota
-        self._limits_card = self._card(si)
-        lp = tk.Frame(self._limits_card.inner, bg=SURF); lp.pack(fill="x", padx=13, pady=12)
-        self._label(lp, "Длительность и хранилище", color=SUB, size=10, bg=SURF).pack(anchor="w")
-
-        # — max seconds row (hidden for local provider)
-        self._max_sec_row = tk.Frame(lp, bg=SURF)
-        ms_inner = tk.Frame(self._max_sec_row, bg=SURF); ms_inner.pack(fill="x", pady=(9, 0))
-        self._label(ms_inner, "Авто-стоп:", color=MUT, size=9, bg=SURF).pack(side="left")
-        self.max_sec_var = tk.StringVar(value=str(self.ctrl.cfg.max_seconds))
-        ms_entry = tk.Entry(ms_inner, textvariable=self.max_sec_var, width=6,
-                            bg=BAR, fg=TXT, insertbackground=TXT, relief="flat",
-                            highlightthickness=1, highlightbackground=BORDER2,
-                            highlightcolor=ACC, font=("Segoe UI", 10), justify="center")
-        ms_entry.pack(side="left", padx=(6, 4), ipady=3)
-        self._label(ms_inner, "сек", color=MUT, size=9, bg=SURF).pack(side="left")
-        self._max_sec_hint = self._label(
-            self._max_sec_row,
-            "рекомендуем ≤ 350 с для Groq",
-            color=MUT, size=8, bg=SURF)
-        self._max_sec_hint.pack(anchor="w", pady=(3, 0))
-
-        # — storage quota row (always visible)
-        mb_row = tk.Frame(lp, bg=SURF); mb_row.pack(fill="x", pady=(10, 0))
-        self._label(mb_row, "Лимит хранилища:", color=MUT, size=9, bg=SURF).pack(side="left")
-        self.max_mb_var = tk.StringVar(value=str(self.ctrl.cfg.max_storage_mb))
-        mb_entry = tk.Entry(mb_row, textvariable=self.max_mb_var, width=6,
-                            bg=BAR, fg=TXT, insertbackground=TXT, relief="flat",
-                            highlightthickness=1, highlightbackground=BORDER2,
-                            highlightcolor=ACC, font=("Segoe UI", 10), justify="center")
-        mb_entry.pack(side="left", padx=(6, 4), ipady=3)
-        self._label(mb_row, "МБ  (0 = без ограничений)", color=MUT, size=9, bg=SURF).pack(side="left")
-        self._storage_usage = self._label(lp, "", color=MUT, size=8, bg=SURF)
-        self._storage_usage.pack(anchor="w", pady=(4, 0))
-
-        save_row = tk.Frame(lp, bg=SURF); save_row.pack(fill="x", pady=(10, 0))
-        self._btn(save_row, "Применить", self._save_limits, primary=True).pack(side="right")
-
-        # 4. Hotkey (always last)
-        self._hk_card = self._card(si)
-        hp = tk.Frame(self._hk_card.inner, bg=SURF); hp.pack(fill="x", padx=13, pady=12)
-        self._label(hp, "Сочетание для старта", color=SUB, size=10, bg=SURF).pack(anchor="w")
-        hrow = tk.Frame(hp, bg=SURF); hrow.pack(fill="x", pady=(9, 0))
-        self.hotkey_var = tk.StringVar(value=self.ctrl.cfg.hotkey)
-        self.hotkey_chip = tk.Label(hrow, textvariable=self.hotkey_var, bg=BAR, fg=TXT,
-                                    font=("Segoe UI", 11), padx=12, pady=6,
-                                    highlightthickness=1, highlightbackground=BORDER2)
-        self.hotkey_chip.pack(side="left")
-        self.capture_btn = self._btn(hrow, "Задать клавишей", self._begin_capture)
-        self.capture_btn.pack(side="right")
-        self._label(hp, "Стоп — Enter, отмена — Esc (во время записи).",
-                    color=MUT, size=8, bg=SURF).pack(anchor="w", pady=(7, 0))
-
-        self._update_prov_seg()
-
-    def _repack_settings(self):
-        for card in [self._prov_card, self._key_card, self._limits_card, self._hk_card]:
-            card.pack_forget()
-        self._prov_card.pack(fill="x", pady=(0, 11))
-        if self.ctrl.cfg.provider == "groq":
-            self._key_card.pack(fill="x", pady=(0, 11))
-        self._limits_card.pack(fill="x", pady=(0, 11))
-        self._hk_card.pack(fill="x")
-        self._refresh_limits_visibility()
-
-    def _select_model(self, mid):
-        self.ctrl.save_settings(model=mid)
-        self._update_seg()
-        self._set_status_text(f"Модель: {mid}")
-
-    def _update_seg(self):
-        cur = self.ctrl.cfg.model
-        for mid, b in self._seg.items():
-            if mid == cur:
-                b.configure(bg=ACC, fg="#ffffff")
-            else:
-                b.configure(bg=SURF2, fg=MUT)
-
-    def _select_provider(self, pid: str) -> None:
-        if pid == "local":
-            models = find_local_whisper_models()
-            if not models and not faster_whisper_available():
-                self._set_status_text(
-                    "⚠ pip install faster-whisper, "
-                    "затем: huggingface-cli download Systran/faster-whisper-tiny")
-                return
-            # Keep existing model selection; default to first found if none saved.
-            current = self.ctrl.cfg.local_model
-            local_model = current if (current and current in models) else (models[0] if models else "")
-            self.ctrl.save_settings(provider="local", local_model=local_model)
-        else:
-            self.ctrl.save_settings(provider="groq")
-        self._update_prov_seg()
-        self._set_status_text(
-            "Провайдер: локальная модель" if pid == "local"
-            else "Провайдер: Groq")
-
-    def _update_prov_seg(self) -> None:
-        cur = self.ctrl.cfg.provider
-        for pid, b in self._prov_seg.items():
-            b.configure(bg=(ACC if pid == cur else SURF2),
-                        fg=("#ffffff" if pid == cur else MUT))
-        if cur == "groq":
-            self._local_sub.pack_forget()
-            self._groq_sub.pack(fill="x")
-            self._update_seg()
-        else:
-            self._groq_sub.pack_forget()
-            self._local_sub.pack(fill="x")
-            self._refresh_local_status()
-        self._repack_settings()
-
-    def _refresh_local_status(self) -> None:
+    # --------------------------------------------------------- Local panel
+    def _build_local_panel(self):
         tk = self.tk
-        for w in self._local_model_frame.winfo_children():
-            w.destroy()
+        l = tk.Frame(self._prov_sub, bg=SURF)
+        self._local_sub = l
 
-        if not faster_whisper_available():
-            self._local_no_model.configure(
-                text="⚠ faster-whisper не установлен.  pip install faster-whisper")
-            return
+        # status strip
+        strip = tk.Frame(l, bg=SURF2, padx=10, pady=8)
+        strip.pack(fill="x")
+        self._loc_dot = tk.Canvas(strip, width=10, height=10, bg=SURF2, highlightthickness=0)
+        self._loc_dot.pack(side="left", pady=(2, 0))
+        self._loc_dot_id = self._loc_dot.create_oval(1, 1, 9, 9, fill=AMBER, outline="")
+        self._loc_head = tk.Label(strip, text="", bg=SURF2, fg=TXT, font=_f(9),
+                                  anchor="w", justify="left", wraplength=380)
+        self._loc_head.pack(side="left", padx=(8, 0), fill="x", expand=True)
 
-        models = find_local_whisper_models()
-        if not models:
-            self._local_no_model.configure(
-                text="⚠ Нет моделей.  hf download Systran/faster-whisper-tiny")
-            return
+        # step 1 — engine
+        s1 = tk.Frame(l, bg=SURF); s1.pack(fill="x", pady=(12, 0))
+        self._step_num(s1, "1")
+        col1 = tk.Frame(s1, bg=SURF); col1.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        r1 = tk.Frame(col1, bg=SURF); r1.pack(fill="x")
+        self._label(r1, "Движок whisper.cpp", color=TXT, size=10, bg=SURF).pack(side="left")
+        self._eng_btn = self._btn(r1, "Установить · 8 МБ", self._install_engine, primary=True, small=True)
+        self._eng_btn.pack(side="right")
+        self._eng_state = self._label(col1, "", color=MUT, size=9, bg=SURF, anchor="w",
+                                      justify="left", wraplength=380)
+        self._eng_state.pack(fill="x", pady=(3, 0))
 
-        self._local_no_model.configure(text="")
-        current = self.ctrl.cfg.local_model
-        if not current or current not in models:
-            current = models[0]
-
-        name = model_display(current)
-        sz = model_size(current)
-
-        # Combobox-style row: fills width, ▾ chevron on right
-        self._local_combo_row = tk.Frame(
-            self._local_model_frame, bg=SURF2, cursor="hand2",
-            highlightthickness=1, highlightbackground=BORDER2)
-        self._local_combo_row.pack(fill="x")
-
-        chev = tk.Label(self._local_combo_row, text="▾", bg=SURF2, fg=MUT,
-                        font=("Segoe UI", 13), padx=10, cursor="hand2")
-        chev.pack(side="right", pady=6)
-        tk.Frame(self._local_combo_row, bg=BORDER2, width=1).pack(
-            side="right", fill="y", pady=3)
-        sz_lbl = tk.Label(self._local_combo_row, text=sz, bg=SURF2, fg=MUT,
-                          font=("Segoe UI", 9), cursor="hand2")
-        sz_lbl.pack(side="right", pady=8, padx=(0, 8))
-        name_lbl = tk.Label(self._local_combo_row, text=f"  {name}", bg=SURF2,
-                            fg=TXT, font=("Segoe UI", 10), anchor="w",
-                            cursor="hand2")
-        name_lbl.pack(side="left", fill="x", expand=True, pady=8)
-
-        for w in list(self._local_combo_row.winfo_children()) + [self._local_combo_row]:
+        # step 2 — model
+        s2 = tk.Frame(l, bg=SURF); s2.pack(fill="x", pady=(12, 0))
+        self._step_num(s2, "2")
+        col2 = tk.Frame(s2, bg=SURF); col2.pack(side="left", fill="x", expand=True, padx=(10, 0))
+        r2 = tk.Frame(col2, bg=SURF); r2.pack(fill="x")
+        self._label(r2, "Модель", color=TXT, size=10, bg=SURF).pack(side="left")
+        rescan = tk.Label(r2, text="⟳ найти на диске", bg=SURF, fg=ACC_H, font=_f(9), cursor="hand2")
+        rescan.pack(side="right")
+        rescan.bind("<Button-1>", lambda e: self._refresh_local(announce=True))
+        self._model_combo = tk.Frame(col2, bg=SURF2, cursor="hand2",
+                                     highlightthickness=1, highlightbackground=BORDER2)
+        self._model_combo.pack(fill="x", pady=(6, 0))
+        self._mc_name = tk.Label(self._model_combo, text="", bg=SURF2, fg=TXT, font=_f(10),
+                                 anchor="w", padx=10, pady=8, cursor="hand2")
+        self._mc_name.pack(side="left", fill="x", expand=True)
+        self._mc_chev = tk.Label(self._model_combo, text="▾", bg=SURF2, fg=MUT, font=_f(12),
+                                 padx=10, cursor="hand2")
+        self._mc_chev.pack(side="right")
+        self._mc_size = tk.Label(self._model_combo, text="", bg=SURF2, fg=MUT, font=_f(9), cursor="hand2")
+        self._mc_size.pack(side="right")
+        for w in (self._model_combo, self._mc_name, self._mc_chev, self._mc_size):
             w.bind("<Button-1>", lambda e: self._show_model_picker())
 
-    def _show_model_picker(self) -> None:
+        # progress (hidden until a download starts; shown right under the picker)
+        self._dl_frame = tk.Frame(col2, bg=SURF)
+        self._dl_label = tk.Label(self._dl_frame, text="", bg=SURF, fg=SUB, font=_f(9), anchor="w")
+        self._dl_label.pack(side="left", fill="x", expand=True)
+        self._dl_cancel_btn = tk.Label(self._dl_frame, text="Отменить", bg=SURF, fg=REC_H,
+                                       font=_f(9), cursor="hand2")
+        self._dl_cancel_btn.pack(side="right")
+        self._dl_cancel_btn.bind("<Button-1>", lambda e: self._cancel_download())
+        self._dl_bar = _Progress(tk, col2)
+        self._dl_hint = self._label(
+            col2, "Модели, которых ещё нет на диске, можно скачать прямо из этого списка ↑",
+            color=DIM, size=8, bg=SURF, anchor="w", justify="left", wraplength=380)
+        self._dl_hint.pack(fill="x", pady=(6, 0))
+
+        # manual
+        man = tk.Frame(col2, bg=SURF); man.pack(fill="x", pady=(12, 0))
+        self._label(man, "Уже есть файл?", color=DIM, size=9, bg=SURF).pack(side="left")
+        lk1 = tk.Label(man, text="Выбрать файл…", bg=SURF, fg=ACC_H, font=_f(9), cursor="hand2")
+        lk1.pack(side="left", padx=(6, 0)); lk1.bind("<Button-1>", lambda e: self._pick_file())
+        self._label(man, "·", color=DIM, size=9, bg=SURF).pack(side="left", padx=4)
+        lk2 = tk.Label(man, text="Папку…", bg=SURF, fg=ACC_H, font=_f(9), cursor="hand2")
+        lk2.pack(side="left"); lk2.bind("<Button-1>", lambda e: self._pick_folder())
+        self._label(man, "(ggml-*.bin, папка faster-whisper или whisper-cli.exe)",
+                    color=DIM, size=8, bg=SURF).pack(side="left", padx=(8, 0))
+
+    def _step_num(self, parent, n):
+        c = self.tk.Canvas(parent, width=22, height=22, bg=SURF, highlightthickness=0)
+        c.pack(side="left", anchor="n", pady=(1, 0))
+        c.create_oval(1, 1, 21, 21, fill=SURF3, outline="")
+        c.create_text(11, 11, text=n, fill=SUB, font=_f(9, True))
+        return c
+
+    # ----------------------------------------------------- Local: actions
+    def _refresh_local(self, announce=False):
+        st = self.ctrl.local_status()
+        self._local_st = st
+        ok = st.ready
+        self._loc_dot.itemconfigure(self._loc_dot_id, fill=GREEN if ok else AMBER)
+        self._loc_head.configure(text=st.headline(), fg=TXT if ok else AMBER)
+        # engine
+        if st.engine is not None:
+            ver = eng.engine_version()
+            self._eng_state.configure(text=f"✓ установлен{(' · ' + ver) if ver else ''}  ·  {st.engine}", fg=GREEN)
+            self._eng_btn.configure(text="Переустановить")
+            self._eng_btn.pack_forget()
+            self._eng_btn.pack(side="right")
+            self._style_secondary(self._eng_btn)
+        else:
+            self._eng_state.configure(text="Официальная сборка ggml-org (~8 МБ), работает на любом CPU. "
+                                           "Без Python и pip.", fg=DIM)
+            self._eng_btn.configure(text="Установить · 8 МБ")
+            self._style_primary(self._eng_btn)
+        # selected model
+        if st.selected is not None:
+            runnable = st.selected in st.runnable_models
+            self._mc_name.configure(text=st.selected.name, fg=TXT if runnable else AMBER)
+            self._mc_size.configure(text=st.selected.size_label)
+        else:
+            self._mc_name.configure(text="Модель не выбрана", fg=MUT)
+            self._mc_size.configure(text="")
+        if announce:
+            n = len(st.models)
+            self._set_status_text(f"Найдено моделей: {n}" if n else
+                                  "Модели не найдены — скачайте одну из списка")
+        self._refresh_hero()
+
+    def _style_primary(self, b):
+        b.configure(bg=ACC, fg="#ffffff", activebackground=ACC_H)
+        b.bind("<Enter>", lambda e: b.configure(bg=ACC_H)); b.bind("<Leave>", lambda e: b.configure(bg=ACC))
+
+    def _style_secondary(self, b):
+        b.configure(bg=SURF2, fg=TXT, activebackground=SURF3)
+        b.bind("<Enter>", lambda e: b.configure(bg=SURF3)); b.bind("<Leave>", lambda e: b.configure(bg=SURF2))
+
+    def _show_model_picker(self):
         tk = self.tk
-        # Toggle: close if already open
-        if self._model_popup is not None:
-            try:
-                self._model_popup.destroy()
-            except Exception:
-                pass
+        if self._popup is not None:
+            try: self._popup.destroy()
+            except Exception: pass
+            self._popup = None
             return
-
-        models = find_local_whisper_models()
-        if not models:
+        st = getattr(self, "_local_st", None) or self.ctrl.local_status()
+        have_ids = {m.spec.id for m in st.models if m.spec}
+        to_download = [s for s in eng.MODEL_CATALOG if s.id not in have_ids]
+        if not st.models and not to_download:
+            self._set_status_text("Список моделей пуст")
             return
-
-        combo = self._local_combo_row
-        combo.update_idletasks()
-        rx = combo.winfo_rootx()
-        ry = combo.winfo_rooty() + combo.winfo_height()
-        rw = combo.winfo_width()
-
+        anchor = self._model_combo
+        anchor.update_idletasks()
+        rx, ry, rw = anchor.winfo_rootx(), anchor.winfo_rooty() + anchor.winfo_height(), anchor.winfo_width()
         popup = tk.Toplevel(self.root)
         popup.overrideredirect(True)
         popup.configure(bg=BORDER2)
-        self._model_popup = popup
-        popup.bind("<Destroy>", lambda e: setattr(self, "_model_popup", None), add="+")
+        self._popup = popup
+        cur = st.selected.path if st.selected else None
 
-        current = self.ctrl.cfg.local_model
+        def _row(bgr):
+            r = tk.Frame(popup, bg=bgr, cursor="hand2"); r.pack(fill="x", pady=(0, 1))
+            return r
 
-        for path in models:
-            name = model_display(path)
-            sz = model_size(path)
-            active = path == current or (not current and path == models[0])
-            bg_row = ACC if active else SURF2
-            fg_row = "#ffffff" if active else TXT
-            fg_sz = "#ffffff" if active else MUT
+        # already on disk — pick to select
+        for m in st.models:
+            runnable = m in st.runnable_models
+            active = m.path == cur
+            bgr = ACC if active else SURF2
+            fgr = "#ffffff" if active else (TXT if runnable else MUT)
+            row = _row(bgr)
+            via = "whisper.cpp" if m.kind == "ggml" else "faster-whisper"
+            if not runnable:
+                via += " · нет движка" if m.kind == "ggml" else " · нет библиотеки"
+            a = tk.Label(row, text=m.name, bg=bgr, fg=fgr, font=_f(10), anchor="w", padx=10, pady=6)
+            a.pack(side="left", fill="x", expand=True)
+            b = tk.Label(row, text=f"{m.size_label}  ·  {via}", bg=bgr,
+                         fg="#ffffff" if active else DIM, font=_f(8), padx=10)
+            b.pack(side="right")
+            for w in (row, a, b):
+                w.bind("<Button-1>", lambda e, p=m.path: self._pick_model(p))
 
-            row = tk.Frame(popup, bg=bg_row, cursor="hand2")
-            row.pack(fill="x", pady=(0, 1))
-            name_lbl = tk.Label(row, text=f"  {name}", bg=bg_row, fg=fg_row,
-                                font=("Segoe UI", 10), anchor="w", pady=9)
-            name_lbl.pack(side="left", fill="x", expand=True)
-            size_lbl = tk.Label(row, text=f"{sz}  ", bg=bg_row, fg=fg_sz,
-                                font=("Segoe UI", 9), pady=9)
-            size_lbl.pack(side="right")
-
-            def make_h(p):
-                def h(e=None):
-                    self.ctrl.save_settings(local_model=p)
-                    self._refresh_local_status()
-                    self._set_status_text(f"Модель: {model_display(p)}")
-                    try: popup.destroy()
-                    except Exception: pass
-                return h
-
-            fn = make_h(path)
-            for w in [row, name_lbl, size_lbl]:
-                w.bind("<Button-1>", fn)
+        # not on disk yet — pick to download
+        if to_download:
+            if st.models:
+                sep = tk.Frame(popup, bg=SURF3, height=1); sep.pack(fill="x", pady=2)
+            hdr = tk.Frame(popup, bg=BORDER2); hdr.pack(fill="x")
+            tk.Label(hdr, text="СКАЧАТЬ", bg=BORDER2, fg=DIM, font=_f(8, True),
+                     anchor="w", padx=10, pady=(4 if st.models else 8)).pack(fill="x")
+            for spec in to_download:
+                row = _row(SURF2)
+                title = spec.title + (" ★" if spec.recommended else "")
+                a = tk.Label(row, text=title, bg=SURF2, fg=TXT if not spec.recommended else AMBER,
+                             font=_f(10), anchor="w", padx=10, pady=6)
+                a.pack(side="left", fill="x", expand=True)
+                b = tk.Label(row, text=f"Скачать · {spec.size_label}", bg=SURF2,
+                             fg=ACC_H, font=_f(9), padx=10)
+                b.pack(side="right")
+                for w in (row, a, b):
+                    w.bind("<Button-1>", lambda e, s=spec: self._pick_download(s))
+                    w.bind("<Enter>", lambda e, ws=(row, a, b): [x.configure(bg=SURF3) for x in ws])
+                    w.bind("<Leave>", lambda e, ws=(row, a, b): [x.configure(bg=SURF2) for x in ws])
 
         popup.update_idletasks()
-        ph = popup.winfo_reqheight()
-        popup.geometry(f"{rw}x{ph}+{rx}+{ry}")
-
-        # Follow combo row width + position live as window is resized
-        def _reposition(e):
-            try:
-                new_rx = combo.winfo_rootx()
-                new_ry = combo.winfo_rooty() + combo.winfo_height()
-                popup.geometry(f"{e.width}x{ph}+{new_rx}+{new_ry}")
-            except Exception:
-                pass
-
-        conf_id = combo.bind("<Configure>", _reposition, add="+")
-        popup.bind("<Destroy>", lambda e: combo.unbind("<Configure>", conf_id))
-
+        popup.geometry(f"{rw}x{popup.winfo_reqheight()}+{rx}+{ry}")
         popup.bind("<Escape>", lambda e: popup.destroy())
+        popup.bind("<Destroy>", lambda e: setattr(self, "_popup", None), add="+")
 
         def _dismiss(e):
             try:
-                target = str(popup.winfo_containing(e.x_root, e.y_root))
-                if not target.startswith(str(popup)):
+                if not str(popup.winfo_containing(e.x_root, e.y_root)).startswith(str(popup)):
                     popup.destroy()
-                    self.root.unbind("<Button-1>")
             except Exception:
                 pass
-
+            self.root.unbind("<Button-1>")
         popup.after(50, lambda: self.root.bind("<Button-1>", _dismiss))
 
-    # ---------- history (scrollable cards, one-click copy / retry) ----------
-    HISTORY_LIMIT = 50
+    def _pick_model(self, path):
+        try:
+            if self._popup: self._popup.destroy()
+        except Exception:
+            pass
+        self.ctrl.select_local_model(path)
+        self._refresh_local()
 
+    def _pick_download(self, spec: eng.ModelSpec):
+        try:
+            if self._popup: self._popup.destroy()
+        except Exception:
+            pass
+        self._download_model(spec)
+
+    def _install_engine(self):
+        if self._dl_running:
+            return
+        self._run_download("Движок whisper.cpp", lambda prog, cancel:
+                           self.ctrl.install_local_engine(progress=prog, cancel=cancel))
+
+    def _download_model(self, spec: eng.ModelSpec):
+        if self._dl_running:
+            self._set_status_text("Дождитесь окончания текущей загрузки")
+            return
+        st = getattr(self, "_local_st", None) or self.ctrl.local_status()
+        if any(m.spec and m.spec.id == spec.id for m in st.models):
+            for m in st.models:
+                if m.spec and m.spec.id == spec.id:
+                    self._pick_model(m.path)
+            return
+        self._run_download(spec.title, lambda prog, cancel:
+                           self.ctrl.download_local_model(spec, progress=prog, cancel=cancel))
+        if st.engine is None:
+            self._set_status_text("Не забудьте установить движок (шаг 1) — модель без него не запустится")
+
+    def _run_download(self, title: str, job):
+        self._dl_running = True
+        self._dl_cancel = threading.Event()
+        self._dl_frame.pack(fill="x", pady=(10, 4), before=self._dl_hint)
+        self._dl_bar.pack(fill="x", before=self._dl_hint)
+        self._dl_bar.set(0); self._dl_bar.pulse(True)
+        self._dl_label.configure(text=f"{title} — подключаюсь…")
+        t0 = time.monotonic()
+        state = {"last": (0, t0)}
+
+        def on_progress(p: eng.Progress):
+            def ui():
+                if p.phase == "download":
+                    self._dl_bar.pulse(False)
+                    self._dl_bar.set(p.fraction)
+                    done_b, t_last = state["last"]
+                    now = time.monotonic()
+                    speed = ""
+                    if now - t_last >= 1.0:
+                        rate = (p.done - done_b) / max(now - t_last, 1e-6)
+                        state["last"] = (p.done, now)
+                        state["rate"] = rate
+                    rate = state.get("rate")
+                    if rate:
+                        left = (p.total - p.done) / rate if p.total else 0
+                        speed = f" · {eng.human_size(int(rate))}/с" + (
+                            f" · ещё ~{int(left // 60)} мин" if left > 90 else
+                            (f" · ещё ~{int(left)} с" if left > 0 else ""))
+                    tot = eng.human_size(p.total) if p.total else "?"
+                    self._dl_label.configure(text=f"{title} — {eng.human_size(p.done)} из {tot}{speed}")
+                elif p.phase in ("verify", "extract"):
+                    self._dl_bar.pulse(True)
+                    self._dl_label.configure(text=f"{title} — {p.label.lower()}…")
+            self._post(ui)
+
+        def worker():
+            try:
+                job(on_progress, self._dl_cancel)
+                self._post(lambda: self._download_done(None))
+            except eng.DownloadCancelled:
+                self._post(lambda: self._download_done("cancelled"))
+            except Exception as exc:  # noqa: BLE001 — shown to the user verbatim
+                msg = str(exc)
+                self._post(lambda: self._download_done(msg))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _download_done(self, error: Optional[str]):
+        self._dl_running = False
+        self._dl_bar.pulse(False)
+        self._dl_frame.pack_forget(); self._dl_bar.cv.pack_forget()
+        if error == "cancelled":
+            self._set_status_text("Загрузка отменена")
+        elif error:
+            self._set_status_text(error, error=True)
+        self._refresh_local()
+
+    def _cancel_download(self):
+        if self._dl_cancel:
+            self._dl_cancel.set()
+
+    def _pick_file(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Модель Whisper или whisper-cli.exe",
+            filetypes=[("Модель GGML / движок", "*.bin *.exe"), ("Все файлы", "*.*")])
+        if path:
+            self.ctrl.use_local_file(path)
+            self._refresh_local()
+
+    def _pick_folder(self):
+        from tkinter import filedialog
+        path = filedialog.askdirectory(parent=self.root, title="Папка с моделями или движком")
+        if not path:
+            return
+        if not self.ctrl.use_local_file(path):      # not a CT2 dir → just remember it
+            self.ctrl.add_local_dir(path)
+            self._set_status_text("Папка добавлена в поиск")
+        self._refresh_local(announce=True)
+
+    # ----------------------------------------------------- provider switch
+    def _select_provider(self, pid: str) -> None:
+        self.ctrl.save_settings(provider=pid)
+        self._update_prov_seg()
+        if pid == "local":
+            st = self.ctrl.local_status()
+            self._set_status_text("Локальный режим включён" if st.ready else
+                                  "Локальный режим: " + st.headline())
+        else:
+            self._set_status_text("Режим: Groq (облако)")
+
+    def _update_prov_seg(self) -> None:
+        cur = self.ctrl.cfg.provider
+        self._paint_segment(self._prov_seg, cur)
+        if cur == "groq":
+            self._local_sub.pack_forget()
+            self._groq_sub.pack(fill="x")
+            self._paint_segment(self._seg, self.ctrl.cfg.model)
+            self._refresh_key_status()
+        else:
+            self._groq_sub.pack_forget()
+            self._local_sub.pack(fill="x")
+            self._refresh_local()
+        self._refresh_limits_visibility()
+        self._refresh_hero()
+
+    def _select_model(self, mid):
+        self.ctrl.save_settings(model=mid)
+        self._paint_segment(self._seg, mid)
+        self._refresh_hero()
+        self._set_status_text(f"Модель Groq: {mid}")
+
+    # ================================================================ history
     def _build_history(self):
         tk = self.tk
         h = tk.Frame(self._body, bg=BG)
         self._history = h
         bar = tk.Frame(h, bg=BG); bar.pack(fill="x", pady=(0, 8))
-        self._btn(bar, "Обновить", self._refresh_history).pack(
-            side="left", expand=True, fill="x", padx=(0, 4))
-        self._btn(bar, "Повторить очередь", self._retry_queue).pack(
-            side="left", expand=True, fill="x", padx=(4, 4))
-        self._btn(bar, "Очистить историю", self._clear_history).pack(
-            side="left", expand=True, fill="x", padx=(4, 0))
+        self._btn(bar, "↻ Повторить очередь", self._retry_queue, small=True).pack(side="left")
+        self._btn(bar, "Очистить", self._clear_history, small=True, danger=True).pack(side="right")
+        self._hist_canvas, self._hist_inner = self._scrollable(h)
 
-        wrap = tk.Frame(h, bg=BG); wrap.pack(fill="both", expand=True)
-        self._hist_canvas = tk.Canvas(wrap, bg=BG, highlightthickness=0, bd=0)
-        import tkinter.ttk as ttk
-        sb = ttk.Scrollbar(wrap, orient="vertical", command=self._hist_canvas.yview,
-                           style="Dark.Vertical.TScrollbar")
-        self._hist_canvas.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        self._hist_canvas.pack(side="left", fill="both", expand=True)
-        self._hist_inner = tk.Frame(self._hist_canvas, bg=BG)
-        self._hist_win = self._hist_canvas.create_window((0, 0), window=self._hist_inner,
-                                                         anchor="nw")
-        self._hist_inner.bind(
-            "<Configure>",
-            lambda e: self._hist_canvas.configure(scrollregion=self._hist_canvas.bbox("all")))
-        self._hist_canvas.bind(
-            "<Configure>",
-            lambda e: self._hist_canvas.itemconfig(self._hist_win, width=e.width))
-        # Shared scroll handler: routes to whichever canvas is active
-        self._active_scroll = None
-        self.root.bind_all("<MouseWheel>", self._on_scroll)
+    def _refresh_history(self):
+        tk = self.tk
+        for w in self._hist_inner.winfo_children():
+            w.destroy()
+        rows = self.ctrl.recent(self.HISTORY_LIMIT)
+        if not rows:
+            e = tk.Frame(self._hist_inner, bg=BG); e.pack(fill="x", pady=30)
+            self._label(e, "Здесь появятся ваши диктовки", color=SUB, size=11).pack()
+            self._label(e, f"Нажмите {self._pretty_key(self.ctrl.cfg.hotkey)} в любом поле и говорите",
+                        color=DIM, size=9).pack(pady=(4, 0))
+            return
+        tagmap = {"pending": ("в очереди", AMBER), "failed": ("ошибка", REC)}
+        for r in rows:
+            rc = _RCard(tk, self._hist_inner, radius=10)
+            rc.pack(fill="x", pady=3, padx=1)
+            card = rc.inner
+            top = tk.Frame(card, bg=SURF); top.pack(fill="x", padx=12, pady=(9, 2))
+            ts = time.strftime("%H:%M", time.localtime(r.ts))
+            day = time.strftime("%d.%m", time.localtime(r.ts))
+            today = time.strftime("%d.%m")
+            self._label(top, ts if day == today else f"{day} {ts}", color=MUT, size=9, bg=SURF).pack(side="left")
+            if r.status in tagmap:
+                label, col = tagmap[r.status]
+                self._label(top, "· " + label, color=col, size=9, bg=SURF).pack(side="left", padx=(6, 0))
+            elif r.status == "cancelled":
+                has_audio = bool(r.audio_path)
+                self._label(top, "· отменено" + (" · аудио ещё ~60 с" if has_audio else ""),
+                            color=AMBER if has_audio else MUT, size=9, bg=SURF).pack(side="left", padx=(6, 0))
+            if r.provider:
+                self._label(top, "локально" if r.provider == "local" else "groq",
+                            color=DIM, size=8, bg=SURF).pack(side="right")
+            body = "(запись отменена)" if r.status == "cancelled" else (
+                r.text or "(нет текста — можно повторить)")
+            tk.Label(card, text=body, bg=SURF, fg=TXT if r.text else MUT, font=_f(10),
+                     wraplength=390, justify="left", anchor="w").pack(fill="x", padx=12)
+            btns = tk.Frame(card, bg=SURF); btns.pack(fill="x", padx=12, pady=(6, 9))
+            if r.text:
+                self._btn(btns, "⧉ Копировать", lambda t=r.text: self._copy_text(t), small=True).pack(side="left")
+            if r.status == "cancelled" and r.audio_path:
+                self._btn(btns, "Оставить аудио", lambda i=r.id: self._keep_cancelled(i), small=True).pack(side="left", padx=(6, 0))
+            elif r.status in ("pending", "failed") and r.audio_path:
+                self._btn(btns, "↻ Повторить", lambda i=r.id: self._retry_one(i), small=True).pack(side="left", padx=(6, 0))
 
-    # ---------- key actions ----------
+    # ================================================================ key
     def _save_key(self):
         self.ctrl.set_api_key(self.key_var.get()); self.key_var.set("")
-        self._refresh_key_status()
+        self._refresh_key_status(); self._refresh_hero()
 
     def _clear_key(self):
-        self.ctrl.clear_api_key(); self._refresh_key_status()
+        self.ctrl.clear_api_key(); self._refresh_key_status(); self._refresh_hero()
 
     def _refresh_key_status(self):
+        if not hasattr(self, "key_status"):
+            return
         if self.ctrl.has_key():
-            self.key_status.configure(text=f"● задан · {self.ctrl.key_hint()}", fg=GREEN)
+            self.key_status.configure(text=f"● сохранён · {self.ctrl.key_hint()}", fg=GREEN)
             if not self.key_var.get():
                 self.key_var.set(self.ctrl.stored_key())
             self._groq_link_lbl.pack_forget()
@@ -631,7 +980,6 @@ class ControlPanel:
             self.key_var.set("")
             self._groq_link_lbl.pack(anchor="w", pady=(8, 0))
 
-    # ---------- clipboard (layout-independent) ----------
     def _enable_clipboard(self, widget):
         widget.bind("<Key>", self._on_clip_key)
         menu = self.tk.Menu(widget, tearoff=0, bg=SURF, fg=TXT,
@@ -648,23 +996,19 @@ class ControlPanel:
         if action is None:
             return None
         w = event.widget
-        if action == "paste":
-            w.event_generate("<<Paste>>")
-        elif action == "copy":
-            w.event_generate("<<Copy>>")
-        elif action == "cut":
-            w.event_generate("<<Cut>>")
+        if action == "paste": w.event_generate("<<Paste>>")
+        elif action == "copy": w.event_generate("<<Copy>>")
+        elif action == "cut": w.event_generate("<<Cut>>")
         elif action == "select_all":
-            try:
-                w.select_range(0, "end"); w.icursor("end")
-            except Exception:
-                pass
+            try: w.select_range(0, "end"); w.icursor("end")
+            except Exception: pass
         return "break"
 
-    # ---------- hotkey capture ----------
+    # ================================================================ hotkey
     def _begin_capture(self):
         self._capturing = True
         self.capture_btn.configure(text="Нажмите сочетание…")
+        self.hotkey_chip.configure(highlightbackground=ACC)
         self.root.bind("<KeyPress>", self._on_capture_key)
         self.root.focus_set()
 
@@ -674,27 +1018,22 @@ class ControlPanel:
         combo = combo_from_state(int(event.state), event.keysym)
         if not combo:
             return
-        self.hotkey_var.set(combo)
         self._end_capture()
         try:
-            self.ctrl.save_settings(hotkey=combo)   # apply immediately
+            self.ctrl.save_settings(hotkey=combo)
+            self.hotkey_var.set(self._pretty_key(combo))
             self._restart_start_hotkey()
-            self._render_hero()
-            self._set_status_text(f"Сочетание: {combo}")
+            self._refresh_hero()
+            self._set_status_text(f"Новое сочетание: {self._pretty_key(combo)}")
         except Exception as exc:
-            self._set_status_text(f"Ошибка: {exc}")
+            self._set_status_text(f"Ошибка: {exc}", error=True)
 
     def _end_capture(self):
         self._capturing = False
-        try:
-            self.root.unbind("<KeyPress>")
-        except Exception:
-            pass
-        self.capture_btn.configure(text="Задать клавишей")
-
-    # ---------- record / hotkeys ----------
-    def _on_record_button(self):
-        self.ctrl.toggle()
+        try: self.root.unbind("<KeyPress>")
+        except Exception: pass
+        self.capture_btn.configure(text="Изменить…")
+        self.hotkey_chip.configure(highlightbackground=BORDER2)
 
     def _start_hotkeys(self):
         try:
@@ -704,7 +1043,7 @@ class ControlPanel:
             self._register_start_hotkey()
         except Exception:
             self._hk = None
-            self._set_status_text("Глобальный хоткей недоступен — используйте кнопку")
+            self._set_status_text("Глобальный хоткей недоступен — используйте кнопку «Запись»")
 
     def _register_start_hotkey(self):
         if not self._hk:
@@ -714,19 +1053,13 @@ class ControlPanel:
 
     def _restart_start_hotkey(self):
         if self._hk and self._start_hk_id is not None:
-            try:
-                self._hk.unregister(self._start_hk_id)
-            except Exception:
-                pass
+            try: self._hk.unregister(self._start_hk_id)
+            except Exception: pass
         self._register_start_hotkey()
 
     def _register_rec_keys(self):
         if not self._hk:
             return
-        # Stale ids would keep Enter/Esc grabbed system-wide and make the next
-        # RegisterHotKey fail (the combo is already owned by our thread), which
-        # left Enter unable to stop a recording. Always clear before re-arming,
-        # and record each id as it is created so a partial failure still unwinds.
         self._unregister_rec_keys()
         for combo, action in ((self.ctrl.cfg.stop_key, self.ctrl.stop_recording),
                               (self.ctrl.cfg.cancel_key, self.ctrl.cancel_recording)):
@@ -734,51 +1067,43 @@ class ControlPanel:
                 self._rec_hk_ids.append(
                     self._hk.register(combo, lambda a=action: self.root.after(0, a)))
             except Exception:
-                self._set_status_text(
-                    f"«{combo}» не удалось назначить — остановите кнопкой в окне")
+                self._set_status_text(f"«{combo}» не удалось назначить — остановите кнопкой в окне")
 
     def _unregister_rec_keys(self):
         if not self._hk:
             return
         for hk in self._rec_hk_ids:
-            try:
-                self._hk.unregister(hk)
-            except Exception:
-                pass
+            try: self._hk.unregister(hk)
+            except Exception: pass
         self._rec_hk_ids = []
 
     def _hotkey_error(self, combo):
         self.root.after(0, lambda: self._set_status_text(
-            f"Сочетание «{combo}» занято — задайте другое в «Настройках»."))
+            f"Сочетание «{combo}» занято другой программой — задайте другое.", error=True))
 
-    # ---------- copy / history ----------
+    # ================================================================ misc actions
     def _copy_text(self, text: str):
         if not text:
-            self._set_status_text("Пусто — нечего копировать"); return
+            self._set_status_text("Пока нечего копировать"); return
         try:
-            self.root.clipboard_clear()
-            self.root.clipboard_append(text)
-            self.root.update()            # keep it on the clipboard after we exit
+            self.root.clipboard_clear(); self.root.clipboard_append(text); self.root.update()
             self._set_status_text("Скопировано в буфер обмена")
         except Exception as exc:
-            self._set_status_text(f"Не удалось скопировать: {exc}")
+            self._set_status_text(f"Не удалось скопировать: {exc}", error=True)
 
     def _copy_last(self):
         self._copy_text(self.ctrl.last_text())
 
     def _open_groq_keys(self):
-        import webbrowser, threading
+        import webbrowser
         threading.Thread(target=lambda: webbrowser.open("https://console.groq.com/keys"),
                          daemon=True).start()
 
     def _refresh_limits_visibility(self):
-        """Show/hide max_seconds row depending on provider."""
-        if not hasattr(self, "_max_sec_row"):
-            return
         if self.ctrl.cfg.provider == "local":
             self._max_sec_row.pack_forget()
         else:
-            self._max_sec_row.pack(fill="x")
+            self._max_sec_row.pack(fill="x", pady=(10, 0), before=self._mb_row)
 
     def _refresh_storage_usage(self):
         try:
@@ -786,38 +1111,35 @@ class ControlPanel:
             limit = self.ctrl.cfg.max_storage_mb
             if limit > 0:
                 self._storage_usage.configure(
-                    text=f"Используется: {used:.1f} МБ из {limit} МБ",
+                    text=f"Занято {used:.1f} МБ из {limit} МБ",
                     fg=REC if used > limit * 0.9 else MUT)
             else:
-                self._storage_usage.configure(
-                    text=f"Используется: {used:.1f} МБ", fg=MUT)
+                self._storage_usage.configure(text=f"Занято {used:.1f} МБ · аудио удаляется через "
+                                                   f"{self.ctrl.cfg.audio_retention_days} дн.", fg=MUT)
         except Exception:
             pass
 
     def _save_limits(self):
         try:
             ms = int(self.max_sec_var.get())
-            if ms <= 0:
-                raise ValueError("должно быть > 0")
+            if ms <= 0: raise ValueError
         except ValueError:
-            self._set_status_text("Авто-стоп: введите целое число секунд > 0"); return
+            self._set_status_text("Авто-стоп: нужно целое число секунд больше 0", error=True); return
         try:
             mb = int(self.max_mb_var.get())
-            if mb < 0:
-                raise ValueError("должно быть ≥ 0")
+            if mb < 0: raise ValueError
         except ValueError:
-            self._set_status_text("Лимит: введите целое число МБ ≥ 0 (0 = без ограничений)"); return
+            self._set_status_text("Лимит хранилища: целое число МБ, 0 — без лимита", error=True); return
+        if ms == self.ctrl.cfg.max_seconds and mb == self.ctrl.cfg.max_storage_mb:
+            return
         self.ctrl.save_settings(max_seconds=ms, max_storage_mb=mb)
         if mb > 0:
-            import threading
             threading.Thread(target=lambda: (
                 self.ctrl.storage.evict_oldest(mb),
-                self.root.after(0, self._refresh_storage_usage),
-                self.root.after(0, self._refresh_history),
-            ), daemon=True).start()
+                self._post(self._refresh_storage_usage),
+                self._post(self._refresh_history)), daemon=True).start()
         self._refresh_storage_usage()
-        self._set_status_text(
-            f"Авто-стоп: {ms} с · лимит: {mb} МБ" if mb else f"Авто-стоп: {ms} с · без ограничений")
+        self._set_status_text("Сохранено")
 
     def _on_cancelled(self, rid: int) -> None:
         try:
@@ -829,102 +1151,39 @@ class ControlPanel:
             pass
 
     def _keep_cancelled(self, rid: int):
-        self.ctrl.keep_cancelled(rid)
-        self._refresh_history()
+        self.ctrl.keep_cancelled(rid); self._refresh_history()
 
     def _retry_queue(self):
-        import threading
         threading.Thread(target=lambda: (self.ctrl.retry_queue(),
-                                         self.root.after(0, self._refresh_history)),
-                         daemon=True).start()
+                                         self._post(self._refresh_history)), daemon=True).start()
 
     def _clear_history(self):
         import tkinter.messagebox as mb
-        if not mb.askyesno("Очистить историю",
-                           "Удалить все записи истории и аудиофайлы?",
+        if not mb.askyesno("Очистить историю?",
+                           "Все распознанные тексты и сохранённые аудио будут удалены. Это нельзя отменить.",
                            parent=self.root):
             return
-        self.ctrl.clear_history()
-        self._refresh_history()
+        self.ctrl.clear_history(); self._refresh_history()
 
     def _retry_one(self, rec_id):
-        import threading
         threading.Thread(target=lambda: (self.ctrl.retry_one(rec_id),
-                                         self.root.after(0, self._refresh_history)),
-                         daemon=True).start()
+                                         self._post(self._refresh_history)), daemon=True).start()
 
-    def _refresh_history(self):
-        tk = self.tk
-        for w in self._hist_inner.winfo_children():
-            w.destroy()
-        rows = self.ctrl.recent(self.HISTORY_LIMIT)
-        if not rows:
-            self._label(self._hist_inner, "Пока нет распознаваний.", color=MUT,
-                        size=10).pack(anchor="w", padx=4, pady=8)
-            return
-        tagmap = {"pending": ("в очереди", AMBER), "failed": ("ошибка", REC)}
-        for r in rows:
-            _rc = _RCard(self.tk, self._hist_inner, radius=8)
-            _rc.pack(fill="x", pady=4, padx=2)
-            card = _rc.inner
-            top = tk.Frame(card, bg=SURF); top.pack(fill="x", padx=10, pady=(8, 2))
-            ts = time.strftime("%H:%M", time.localtime(r.ts))
-            self._label(top, ts, color=MUT, size=9, bg=SURF).pack(side="left")
-            if r.status in tagmap:
-                label, col = tagmap[r.status]
-                self._label(top, "· " + label, color=col, size=9, bg=SURF).pack(
-                    side="left", padx=(6, 0))
-            elif r.status == "cancelled":
-                has_audio = bool(r.audio_path)
-                hint = "· отменено · аудио ~60 с" if has_audio else "· отменено"
-                self._label(top, hint, color=AMBER if has_audio else MUT,
-                            size=9, bg=SURF).pack(side="left", padx=(6, 0))
-            if r.status == "cancelled":
-                body = "(запись отменена)"
-            else:
-                body = r.text if r.text else "(нет текста — можно повторить)"
-            tk.Label(card, text=body, bg=SURF, fg=TXT if r.text else MUT,
-                     font=("Segoe UI", 10), wraplength=360, justify="left"
-                     ).pack(fill="x", padx=10, anchor="w")
-            btns = tk.Frame(card, bg=SURF); btns.pack(fill="x", padx=10, pady=(4, 8))
-            if r.text:
-                self._btn(btns, "⧉ Копировать",
-                          lambda t=r.text: self._copy_text(t)).pack(side="left")
-            if r.status == "cancelled" and r.audio_path:
-                self._btn(btns, "Сохранить аудио",
-                          lambda i=r.id: self._keep_cancelled(i)).pack(side="left", padx=(6, 0))
-            elif r.status in ("pending", "failed") and r.audio_path:
-                self._btn(btns, "↻ Повторить",
-                          lambda i=r.id: self._retry_one(i)).pack(side="left", padx=(6, 0))
-
-    # ---------- status ----------
+    # ================================================================ status
     def _on_status(self, state: State, message: str):
         try:
             self.root.after(0, lambda: self._apply_status(state, message))
         except Exception:
             pass
 
-    def _chip_layout(self, label: str) -> None:
-        """Reposition the dot (oval/square) so dot+text sit centered as a group."""
-        try:
-            import tkinter.font as tkfont
-            tw = tkfont.Font(family="Segoe UI", size=11).measure(label)
-        except Exception:
-            tw = max(1, len(label) * 7)
-        DOT_R, GAP, CHIP_W, CHIP_H = 5, 8, 132, 34
-        x0 = (CHIP_W - DOT_R * 2 - GAP - tw) / 2
-        dx, dy = x0 + DOT_R, CHIP_H // 2
-        self._chip_cv.coords(self._chip_oval, dx - DOT_R, dy - DOT_R, dx + DOT_R, dy + DOT_R)
-        self._chip_cv.coords(self._chip_sq, dx - 4, dy - 4, dx + 4, dy + 4)
-
     def _apply_status(self, state: State, message: str):
-        color, label = _DOT.get(state, (GREEN, "Запись"))
+        color, label, title = _STATE.get(state, _STATE[State.IDLE])
         if state is State.IDLE:
             chip_fill, dot_fill, text_fill, outline = ACC, GREEN, "#ffffff", ""
         elif state is State.RECORDING:
             chip_fill, dot_fill, text_fill, outline = REC, None, "#ffffff", ""
         else:
-            chip_fill, dot_fill, text_fill, outline = SURF, color, TXT, BORDER
+            chip_fill, dot_fill, text_fill, outline = SURF2, color, TXT, BORDER2
         self._chip_cv.itemconfigure(self._chip_pill, fill=chip_fill, outline=outline)
         self._chip_cv.itemconfigure(self._chip_txt, text=label, fill=text_fill)
         self._chip_layout(label)
@@ -934,17 +1193,27 @@ class ControlPanel:
         else:
             self._chip_cv.itemconfigure(self._chip_oval, fill=dot_fill, state="normal")
             self._chip_cv.itemconfigure(self._chip_sq, state="hidden")
-        self._set_status_text(message)
+        self._hero_dot.itemconfigure(self._hero_dot_id, fill=color)
+        self._hero_title.configure(text=title)
+        if message and not message.startswith("Готов."):
+            self._set_status_text(message)
+        elif state is State.IDLE:
+            self._set_status_text("")
         if state is State.IDLE:
             self.root.after(900, self._refresh_history)
 
-    def _set_status_text(self, text: str):
-        self.status_lbl.configure(text=text)
+    def _set_status_text(self, text: str, error: bool = False):
+        self.status_lbl.configure(text=text, fg=REC_H if error else MUT)
+        if self._status_after:
+            try: self.root.after_cancel(self._status_after)
+            except Exception: pass
+            self._status_after = None
+        if text and not error and self.ctrl.state.state is State.IDLE:
+            self._status_after = self.root.after(6000, lambda: self.status_lbl.configure(text=""))
 
     def _on_close(self):
         try:
-            if self._hk:
-                self._hk.stop()
+            if self._hk: self._hk.stop()
         except Exception:
             pass
         self.root.destroy()

@@ -22,7 +22,7 @@
 
 - **Works in any field** — chat, browser, editor, terminal, address bar. No per-app setup.
 - **Global hotkey** — start with `Ctrl+Space` (configurable), **stop with `Enter`**, **cancel with `Esc`**.
-- **Two transcription modes** — cloud via Groq Whisper API, or fully offline via a local faster-whisper model (switch in one click, no restart).
+- **Two transcription modes** — cloud via Groq Whisper API, or fully offline with a bundled-on-demand [whisper.cpp](https://github.com/ggml-org/whisper.cpp) engine. Switch in one click, no restart, no Python or pip — the app downloads the engine (~8 MB) and a model of your choice itself.
 - **Live overlay** — a floating pill shows it's recording and *which app* text will land in.
 - **Nothing is lost** — last transcript stays on the clipboard, History has one-click copy and per-item retry, failed items are queued for later.
 - **Private by default** — audio and history stay on your machine; API key lives in Windows Credential Manager, never in a file.
@@ -41,8 +41,8 @@
 2. Double-click it. Windows shows *"Windows protected your PC"* — click **More info**, then **Run anyway**. The build is not code-signed, so that warning is expected.
 3. On first launch it copies itself somewhere permanent and puts a **SpokenGo** icon on your Desktop. You can delete the download afterwards.
 
-No Python, no terminal, no ZIP. Cloud mode only — the binary does not carry the
-offline local-Whisper model, so pick Option B if you need that.
+No Python, no terminal, no ZIP. Offline mode works from the .exe too — see
+[Local mode](#local-mode-offline-no-api-key) below.
 
 ### Option B — install from source
 
@@ -58,8 +58,8 @@ The installer creates an isolated `.venv`, installs SpokenGo and its dependencie
 asks for your Groq API key (optional — you can add it later), and puts a shortcut
 on the Desktop and in the Start Menu.
 
-Choose this one if you want the offline local-Whisper mode, want to read the code
-you are running, or want to update with `git pull`.
+Choose this one if you want to read the code you are running, hack on it, or
+update with `git pull`.
 
 ---
 
@@ -74,35 +74,62 @@ The key is stored in Windows Credential Manager (service `SpokenGo`), never on d
 
 ## Local mode (offline, no API key)
 
-SpokenGo can transcribe entirely on your machine using [faster-whisper](https://github.com/SYSTRAN/faster-whisper). No internet connection or API key required.
+SpokenGo can transcribe entirely on your machine. No internet connection or API
+key is needed once set up, and nothing leaves your computer.
 
-**Step 1 — install the library** (once, into the same environment as SpokenGo):
+Open **Settings → Распознавание → 🖥 Локально** and follow the two steps in the
+window:
+
+1. **Установить движок** — downloads the official
+   [whisper.cpp](https://github.com/ggml-org/whisper.cpp) command-line build
+   (`whisper-bin-x64.zip`, ~8 MB, SHA-256 verified) into
+   `%LOCALAPPDATA%\SpokenGo\engine`. It runs on any x64 CPU — the right
+   instruction set (SSE4.2 … AVX-512) is picked automatically at start.
+2. **Скачать модель** — pick one from the list; it lands in
+   `%LOCALAPPDATA%\SpokenGo\models` with a progress bar and is selected
+   automatically.
+
+| Model | Size | Speed | Accuracy | Notes |
+|---|---|---|---|---|
+| Tiny | 78 MB | ●●●●● | ●○○○○ | short English phrases |
+| Base | 148 MB | ●●●●○ | ●●○○○ | tolerable Russian |
+| Small | 488 MB | ●●●○○ | ●●●○○ | good balance on a weak laptop |
+| **Large v3 Turbo · q5** ★ | 574 MB | ●●●○○ | ●●●●● | near-Groq quality, recommended |
+| Large v3 Turbo | 1.6 GB | ●●○○○ | ●●●●● | best accuracy, needs a strong CPU |
+
+Already have a model? SpokenGo also **finds models on its own**: its models
+folder, `~/whisper.cpp/models`, `Downloads`, every HuggingFace cache location
+(`HF_HOME`, `HUGGINGFACE_HUB_CACHE`, `~/.cache/huggingface`, `%USERPROFILE%`),
+plus any folder you add with **Папку…**. **Выбрать файл…** accepts a
+`ggml-*.bin` file, a faster-whisper snapshot folder, or a `whisper-cli.exe` you
+built yourself.
+
+<details>
+<summary>faster-whisper (optional, source installs only)</summary>
+
+If `faster-whisper` is importable in the environment SpokenGo runs from, its
+CTranslate2 models (e.g. `Systran/faster-whisper-medium` from the HF cache) show
+up in the same picker and run through that library instead. The one-file `.exe`
+cannot import packages installed afterwards, which is why whisper.cpp is the
+default engine for everyone.
 
 ```powershell
 .venv\Scripts\pip install faster-whisper
-```
-
-**Step 2 — download a model:**
-
-```powershell
 .venv\Scripts\huggingface-cli download Systran/faster-whisper-medium
 ```
+</details>
 
-Models are cached in `~/.cache/huggingface/hub/`. Available sizes:
+Headless / scripted setup:
 
-| Model | Size | Speed | Accuracy |
-|---|---|---|---|
-| `Systran/faster-whisper-tiny` | ~75 MB | fastest | lower |
-| `Systran/faster-whisper-base` | ~145 MB | fast | good |
-| `Systran/faster-whisper-small` | ~465 MB | good | good |
-| `Systran/faster-whisper-medium` | ~1.5 GB | moderate | **great** |
-| `Systran/faster-whisper-large-v3` | ~3 GB | slow | best |
+```powershell
+spokengo local                 # what is installed, what is selected, what is missing
+spokengo local install         # fetch the engine
+spokengo local models          # catalogue
+spokengo local download small  # fetch a model and switch to local mode
+```
 
-**Step 3 — switch in the app:**
-
-Open **Settings → Провайдер → 🖥 Локально**. SpokenGo auto-detects the downloaded model and switches immediately. Switch back to ☁ Groq any time.
-
-> Runs on CPU by default (`int8` quantization). No GPU required.
+> Runs on CPU. No GPU required. If your network blocks GitHub or Hugging Face,
+> download the two files elsewhere and point SpokenGo at them with **Выбрать файл…**.
 
 ---
 
@@ -134,7 +161,7 @@ Undo with `scripts\autostart.ps1 -Remove`. A single-instance guard prevents doub
 | Audio recordings | `%APPDATA%\SpokenGo\` — local only, auto-deleted after N days (configurable) |
 | Transcript history | `%APPDATA%\SpokenGo\` — local only |
 | Network (cloud mode) | One endpoint only: `api.groq.com` |
-| Network (local mode) | None — transcription runs entirely on your machine |
+| Network (local mode) | None while transcribing. Only the one-time downloads: `github.com` (engine) and `huggingface.co` (model) |
 
 No telemetry. No analytics. No background calls. Failed transcriptions are retried only when you press **Retry**.
 
@@ -154,6 +181,7 @@ spokengo install --start-menu    # also add to Start Menu
 spokengo set-key groq <KEY>      # store a Groq API key
 spokengo history                 # print recent transcripts
 spokengo logs -n 50              # view log file (for troubleshooting)
+spokengo local [install|download <id>|models]   # offline engine + models, no GUI
 spokengo --version
 ```
 
@@ -163,7 +191,7 @@ spokengo --version
 
 ```bash
 pip install -e ".[dev]"
-pytest            # 91 tests, run on any OS without hardware
+pytest            # 140 tests, run on any OS without hardware or network
 ```
 
 The platform layer (win32 injection, microphone, global hotkeys, overlay window) is isolated behind interfaces and mocked in tests — the entire core (state machine, providers, queue, storage, clipboard cycle) is tested without Windows or a network connection.

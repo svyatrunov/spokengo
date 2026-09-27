@@ -42,7 +42,9 @@ class Config:
     inject_fallback_typing: bool = True   # type char-by-char if paste fails
     restore_clipboard: bool = False       # False = keep last transcript on clipboard (Ctrl+V works anywhere)
     auto_retry: bool = False              # background retry of the offline queue (off by default)
-    local_model: str = ""                 # absolute path to a faster-whisper snapshot dir; "" = auto-detect
+    local_model: str = ""                 # GGML .bin file (whisper.cpp) or faster-whisper snapshot dir; "" = auto
+    local_model_dirs: list = field(default_factory=list)  # extra folders to scan for models / engine
+    local_threads: int = 0                # CPU threads for whisper.cpp; 0 = auto
     max_storage_mb: int = 0              # audio storage quota in MB; 0 = unlimited
     debug_focus: bool = False             # log where the caret is at each step
 
@@ -67,6 +69,11 @@ class Config:
             raise ConfigError("max_seconds must be positive")
         if self.max_storage_mb < 0:
             raise ConfigError("max_storage_mb must be ≥ 0 (0 = unlimited)")
+        if self.local_threads < 0:
+            raise ConfigError("local_threads must be ≥ 0 (0 = auto)")
+        if not isinstance(self.local_model_dirs, list) or not all(
+                isinstance(d, str) for d in self.local_model_dirs):
+            raise ConfigError("local_model_dirs must be a list of strings")
 
     def to_toml(self) -> str:
         lines = ["# SpokenGo config. The API key is NOT here (it is in the OS",
@@ -77,11 +84,16 @@ class Config:
             elif isinstance(v, bool):
                 lines.append(f"{k} = {str(v).lower()}")
             elif isinstance(v, str):
-                escaped = v.replace("\\", "\\\\")
-                lines.append(f'{k} = "{escaped}"')
+                lines.append(f'{k} = {_toml_str(v)}')
+            elif isinstance(v, list):
+                lines.append(f"{k} = [{', '.join(_toml_str(str(x)) for x in v)}]")
             else:
                 lines.append(f"{k} = {v}")
         return "\n".join(lines) + "\n"
+
+
+def _toml_str(v: str) -> str:
+    return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def load_config(path: Path | None = None) -> Config:
