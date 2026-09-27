@@ -97,7 +97,8 @@ def test_finds_models_in_downloads_and_models_dir_and_hf_cache(sandbox):
     names = sorted(Path(m.path).name for m in eng.find_ggml_models())
     assert names == ["ggml-base.bin", "ggml-large-v3-turbo-q5_0.bin", "ggml-tiny.bin"]
     turbo = next(m for m in eng.find_ggml_models() if "turbo" in m.path)
-    assert turbo.spec is not None and turbo.spec.recommended
+    # Still recognised by name, but no longer recommended: minutes per phrase on a CPU.
+    assert turbo.spec is not None and not turbo.spec.recommended and turbo.slow
     assert turbo.name == "Large v3 Turbo · q5"
 
 
@@ -229,7 +230,7 @@ def test_download_model_ok_and_selected_by_controller(sandbox, tmp_path):
     from spokengo.config import Config
     from spokengo.controller import GuiController
     from spokengo.storage import Storage
-    spec = eng.catalog_by_id("large-v3-turbo-q5_0")
+    spec = eng.catalog_by_id("small")
     ctrl = GuiController(cfg=Config(), root_dir=tmp_path / "cfg",
                          storage=Storage(tmp_path / "cfg"))
     import spokengo.transcribe.local_engine as mod
@@ -247,7 +248,7 @@ def test_download_model_ok_and_selected_by_controller(sandbox, tmp_path):
 def test_catalog_has_one_recommended_and_valid_urls():
     recs = [m for m in eng.MODEL_CATALOG if m.recommended]
     assert len(recs) == 1
-    for m in eng.MODEL_CATALOG:
+    for m in eng.MODEL_CATALOG + eng.SLOW_MODELS:
         assert m.url.startswith("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-")
         assert m.filename.endswith(".bin") and m.size_bytes > 10_000_000
     assert eng.ENGINE_URL.endswith("whisper-bin-x64.zip") and len(eng.ENGINE_SHA256) == 64
@@ -317,7 +318,8 @@ def test_provider_auto_picks_recommended_ggml_and_runs(sandbox, monkeypatch):
     md = eng.models_dir()
     md.mkdir(parents=True)
     (md / "ggml-tiny.bin").write_bytes(_ggml_bytes())
-    (md / "ggml-large-v3-turbo-q5_0.bin").write_bytes(_ggml_bytes())
+    (md / "ggml-small.bin").write_bytes(_ggml_bytes())
+    (md / "ggml-large-v3-turbo-q5_0.bin").write_bytes(_ggml_bytes(3_000_000))
     calls = []
     monkeypatch.setattr(eng, "run_engine",
                         lambda e, m, w, **kw: calls.append((e, m)) or "ok text")
@@ -326,7 +328,7 @@ def test_provider_auto_picks_recommended_ggml_and_runs(sandbox, monkeypatch):
     wav.write_bytes(b"RIFF")
     tr = prov.transcribe(str(wav), language=None)
     assert tr.text == "ok text"
-    assert calls[0][1].name == "ggml-large-v3-turbo-q5_0.bin"
+    assert calls[0][1].name == "ggml-small.bin"
 
 
 def test_provider_without_engine_gives_actionable_error(sandbox):
@@ -390,3 +392,52 @@ def test_controller_use_local_file_and_dirs(sandbox, tmp_path):
     e.write_bytes(b"x")
     assert ctrl.use_local_file(str(e))
     assert ctrl.local_status().engine == e
+
+
+# ---------------------------------------------------------------- catalog policy
+def test_download_list_has_no_large_models_and_recommends_small():
+    ids = [m.id for m in eng.MODEL_CATALOG]
+    assert "large-v3-turbo" not in ids and "large-v3-turbo-q5_0" not in ids
+    assert not any(m.slow for m in eng.MODEL_CATALOG)
+    assert [m.id for m in eng.MODEL_CATALOG if m.recommended] == ["small"]
+    # Large models stay known (for files already on disk) but flagged slow.
+    for mid in ("large-v3-turbo", "large-v3-turbo-q5_0"):
+        spec = eng.catalog_by_id(mid)
+        assert spec is not None and spec.slow and not spec.recommended
+
+
+def test_hand_picked_large_file_is_supported_but_marked_slow(sandbox):
+    f = sandbox / "my-whisper-large-v2.bin"
+    f.write_bytes(_ggml_bytes())
+    m = eng.classify_model_path(str(f))
+    assert m is not None and m.kind == "ggml" and m.spec is None and m.slow
+    small = sandbox / "ggml-small.bin"
+    small.write_bytes(_ggml_bytes())
+    assert not eng.classify_model_path(str(small)).slow
+
+
+def test_selected_large_model_still_runs_and_headline_says_slow(sandbox, monkeypatch):
+    monkeypatch.setattr(lp, "faster_whisper_available", lambda: False)
+    eng.engine_dir().mkdir(parents=True)
+    (eng.engine_dir() / eng.ENGINE_EXE).write_bytes(b"x")
+    eng.models_dir().mkdir(parents=True)
+    big = eng.models_dir() / "ggml-large-v3-turbo.bin"
+    big.write_bytes(_ggml_bytes())
+    st = lp.diagnose(local_model=str(big))
+    assert st.ready and st.selected.path == str(big)
+    assert "медленно" in st.headline()
+
+
+def test_default_pick_prefers_fast_model_over_bigger_slow_one(sandbox, monkeypatch):
+    monkeypatch.setattr(lp, "faster_whisper_available", lambda: False)
+    eng.engine_dir().mkdir(parents=True)
+    (eng.engine_dir() / eng.ENGINE_EXE).write_bytes(b"x")
+    eng.models_dir().mkdir(parents=True)
+    (eng.models_dir() / "ggml-base.bin").write_bytes(_ggml_bytes())
+    (eng.models_dir() / "ggml-large-v3-turbo-q5_0.bin").write_bytes(_ggml_bytes(3_000_000))
+    st = lp.diagnose()
+    assert st.selected.name == "Base"
+    # With only a slow model on disk it is still picked: slow beats nothing.
+    (eng.models_dir() / "ggml-base.bin").unlink()
+    st = lp.diagnose()
+    assert st.ready and st.selected.slow

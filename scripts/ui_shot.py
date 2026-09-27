@@ -1,7 +1,10 @@
 """Dev aid: render the control panel headlessly and save a screenshot.
 
 Usage (Linux, needs python3-tk + ImageMagick):
-  xvfb-run -a python scripts/ui_shot.py settings out.png [local] [dl|picker|hist]
+  xvfb-run -a python scripts/ui_shot.py settings out.png [local] [dl|picker|hist|slow]
+
+Optional: SHOT_STATE=recording|transcribing|error renders the status panel in
+that state (with a sample message for "error").
 """
 import os, sys, subprocess, time
 import pathlib
@@ -29,6 +32,8 @@ if scenario:
     (eng.engine_dir() / "engine.json").write_text('{"version": "v1.9.2"}')
     for n in ("ggml-small.bin", "ggml-large-v3-turbo-q5_0.bin"):
         (eng.models_dir() / n).write_bytes(eng.GGML_MAGIC + b"\0" * 1_500_000)
+    if scenario == "slow":
+        p.ctrl.select_local_model(str(eng.models_dir() / "ggml-large-v3-turbo-q5_0.bin"))
     p._refresh_local()
     if scenario == "dl":
         def job(prog, cancel):
@@ -44,6 +49,14 @@ if scenario:
     if scenario == "hist":
         for i, t in enumerate(["Привет, это тестовая диктовка в Телеграм.", "", "Ещё одна запись подлиннее, чтобы посмотреть перенос строк в карточке истории."]):
             p.ctrl.storage.add(t, "local" if i else "groq", "m", 3.0, status=("pending" if not t else "done"))
+state = os.environ.get("SHOT_STATE", "")
+if state:
+    from spokengo.state import State
+    p.root.update()          # flush the controller's pending "settings saved" event
+    p._apply_status(State(state), "")
+    if state == "error":
+        p._set_status_text("Groq недоступен (status 0): The write operation timed out. "
+                           "Аудио сохранено, повторите из Истории.", error=True)
 p._show_tab(tab)
 p.root.update()
 time.sleep(0.6)

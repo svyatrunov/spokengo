@@ -54,7 +54,7 @@ USER_AGENT = "SpokenGo (+https://github.com/svyatrunov/spokengo)"
 
 @dataclass(frozen=True)
 class ModelSpec:
-    """A downloadable GGML model from the official ggerganov/whisper.cpp repo."""
+    """A GGML model from the official ggerganov/whisper.cpp repo."""
     id: str                # short id used in UI / config, e.g. "small"
     filename: str          # e.g. "ggml-small.bin"
     size_bytes: int        # approximate, for the progress bar before headers arrive
@@ -63,6 +63,7 @@ class ModelSpec:
     speed: int             # 1..5 (5 = fastest)
     quality: int           # 1..5 (5 = best)
     recommended: bool = False
+    slow: bool = False     # too slow for dictation on an ordinary CPU
 
     @property
     def url(self) -> str:
@@ -73,26 +74,47 @@ class ModelSpec:
         return human_size(self.size_bytes)
 
 
+# Offered for download in the UI. Local mode is the offline fallback; Groq is
+# the fast path. On a typical laptop CPU whisper.cpp needs a few seconds per
+# phrase with Small, but a minute or more with the large models, which makes
+# dictation unusable. So only models that stay interactive on a CPU are listed.
+# Small is recommended: for Russian its word error rate is roughly half of
+# Base's, at about 2-3x Base's run time, still a few seconds per phrase.
 MODEL_CATALOG: List[ModelSpec] = [
     ModelSpec("tiny", "ggml-tiny.bin", 77_700_000,
-              "Tiny", "мгновенно, для коротких фраз на английском", 5, 1),
+              "Tiny", "мгновенно, но для русского слабовато", 5, 1),
     ModelSpec("base", "ggml-base.bin", 148_000_000,
               "Base", "быстро, терпимо для русского", 4, 2),
     ModelSpec("small", "ggml-small.bin", 488_000_000,
-              "Small", "хороший баланс на слабом ноутбуке", 3, 3),
-    ModelSpec("large-v3-turbo-q5_0", "ggml-large-v3-turbo-q5_0.bin", 574_000_000,
-              "Large v3 Turbo · q5", "почти качество Groq, ~0.6 ГБ", 3, 5,
+              "Small", "лучший баланс скорости и точности на CPU", 3, 3,
               recommended=True),
+]
+
+# Recognised when found on disk (or picked by hand) and still fully supported,
+# but never offered for download: on a CPU a short phrase takes over a minute.
+SLOW_MODELS: List[ModelSpec] = [
+    ModelSpec("large-v3-turbo-q5_0", "ggml-large-v3-turbo-q5_0.bin", 574_000_000,
+              "Large v3 Turbo · q5", "точно, но медленно на CPU", 1, 5, slow=True),
     ModelSpec("large-v3-turbo", "ggml-large-v3-turbo.bin", 1_620_000_000,
-              "Large v3 Turbo", "максимум точности, 1.6 ГБ и мощный CPU", 2, 5),
+              "Large v3 Turbo", "точно, но очень медленно на CPU", 1, 5, slow=True),
 ]
 
 
 def catalog_by_id(model_id: str) -> Optional[ModelSpec]:
-    for m in MODEL_CATALOG:
+    """Any known model, downloadable or not, by id or file name."""
+    for m in MODEL_CATALOG + SLOW_MODELS:
         if m.id == model_id or m.filename == model_id:
             return m
     return None
+
+
+_SLOW_NAME_HINTS = ("large", "medium")
+
+
+def is_slow_name(name: str) -> bool:
+    """Heuristic for models we have no spec for (user-picked files, CT2 dirs)."""
+    low = name.lower()
+    return any(h in low for h in _SLOW_NAME_HINTS)
 
 
 def human_size(n: int) -> str:
@@ -211,6 +233,13 @@ class LocalModel:
     @property
     def size_label(self) -> str:
         return human_size(self.size_bytes)
+
+    @property
+    def slow(self) -> bool:
+        """Large/medium models: supported, but minutes per phrase on a CPU."""
+        if self.spec is not None:
+            return self.spec.slow
+        return is_slow_name(self.name) or is_slow_name(Path(self.path).name)
 
 
 def ggml_display_name(path: Path) -> str:
@@ -626,8 +655,8 @@ def run_engine(exe: Path, model: Path, wav: Path, *, language: Optional[str] = N
                        creationflags=_creationflags(), env=_env_for(exe))
         except subprocess.TimeoutExpired:
             raise ProviderError(
-                "Локальное распознавание не уложилось в лимит времени — "
-                "выберите модель поменьше (Small или Turbo q5).")
+                "Локальное распознавание не уложилось в лимит времени. "
+                "Выберите модель поменьше (Small или Base) или переключитесь на Groq.")
         except FileNotFoundError:
             raise ConfigError("Движок whisper.cpp не найден — переустановите его в Настройках.")
         except OSError as exc:

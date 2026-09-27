@@ -13,6 +13,7 @@ Status 0 is our sentinel for "could not reach the server" (DNS/timeout/conn).
 from __future__ import annotations
 
 import json
+import os
 import time
 from typing import Callable, Optional
 
@@ -28,6 +29,23 @@ GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 USER_AGENT = f"SpokenGo/{__version__} (+https://github.com/spokengo)"
 # Valid Groq speech-to-text models (docs/speech-to-text). Used to warn early.
 KNOWN_MODELS = ("whisper-large-v3-turbo", "whisper-large-v3")
+
+# Upload timeout. urllib sends the whole multipart body with one sendall(),
+# and since Python 3.5 the socket timeout bounds that *entire* call, so a flat
+# 15 s failed every long recording on an ordinary uplink ("The write
+# operation timed out" for an ~18 MB WAV). The timeout therefore scales with
+# the file: a base for connect + server-side transcription, plus the time the
+# upload needs at a deliberately pessimistic rate. Short dictations keep the
+# fail-fast behaviour (a 1 MB clip still gives up after ~25 s).
+BASE_TIMEOUT = 15.0
+MIN_UPLOAD_RATE = 100_000          # bytes/s, about 0.8 Mbit/s
+MAX_TIMEOUT = 300.0
+
+
+def upload_timeout(size_bytes: int, base: float = BASE_TIMEOUT) -> float:
+    """Seconds to allow one request that uploads ``size_bytes`` of audio."""
+    t = base + max(size_bytes, 0) / MIN_UPLOAD_RATE
+    return max(base, min(t, MAX_TIMEOUT))
 
 
 class _Resp:
@@ -90,12 +108,12 @@ def _error_message(body: bytes) -> str:
 class GroqProvider:
     name = "groq"
 
-    def __init__(self, api_key, *, timeout=15.0, max_retries=1, base_url=GROQ_URL,
+    def __init__(self, api_key, *, timeout=BASE_TIMEOUT, max_retries=1, base_url=GROQ_URL,
                  http_post=_http_post_multipart, sleep: Callable[[float], None] = time.sleep):
         if not api_key:
             raise AuthError("Groq API key is not set")
         self.api_key = api_key
-        self.timeout = timeout
+        self.timeout = timeout          # base; grows with the file, see upload_timeout
         self.max_retries = max_retries
         self.base_url = base_url
         self._http_post = http_post
@@ -110,10 +128,16 @@ class GroqProvider:
         if language:
             fields["language"] = language
 
+        try:
+            size = os.path.getsize(audio_path)
+        except OSError:
+            size = 0
+        timeout = upload_timeout(size, self.timeout)
+
         attempt = 0
         while True:
             resp = self._http_post(
-                self.base_url, headers, fields, "file", audio_path, self.timeout)
+                self.base_url, headers, fields, "file", audio_path, timeout)
             s = resp.status
             if s == 200:
                 data = json.loads(resp.body.decode("utf-8"))
